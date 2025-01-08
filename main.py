@@ -259,8 +259,8 @@ if __name__ == "__main__":
                         choices=['sequential', 'parallel'],
                         help='Choose the CN update mode: sequential or parallel') 
 
-    parser.add_argument('--loss_option', type=int, default=1) #0 -> average all iterations, 1 -> last iteration only 
-    parser.add_argument('--loss_type', type=int, default=2) #0: BCE, 1: Soft_BER, 2: FER
+    parser.add_argument('--loss_option', type=int, default=2) #0: BCE, 1: Soft_BER, 2: FER
+    parser.add_argument('--loss_type', type=int, default=1) #0 -> average all iterations, 1 -> last iteration only 
 
     parser.add_argument('--sampling_type', type=int, default=0) #0: Random Generation 1: Uncor read
     parser.add_argument('--SNR_array', nargs='+', type=float, 
