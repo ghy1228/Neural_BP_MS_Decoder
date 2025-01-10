@@ -182,6 +182,7 @@ def run_training(args, net, code_param, device, rng, epoch):
         loss_val = net(llr_batch)
         loss_val.backward()
         optimizer.step()
+        net.clamp_weights()
         bs = llr_batch.size(0)
         total_loss  += loss_val.item() * bs
         total_count += bs
