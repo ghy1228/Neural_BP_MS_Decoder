@@ -376,3 +376,14 @@ class LDPCNetwork(nn.Module):
             return fer.mean()
         else:
             return torch.zeros(1, device=dec_llr.device)
+
+    def clamp_weights(self):
+        """
+        Optimizer step 이후에 각 파라미터를 특정 범위로 clamp.
+        """
+        if self.cn_weight is not None:
+            self.cn_weight.data.clamp_(0.0, 3.0)
+        if self.ucn_weight is not None:
+            self.ucn_weight.data.clamp_(0.0, 3.0)
+        if self.ch_weight is not None:
+            self.ch_weight.data.clamp_(0.0, 3.0)
