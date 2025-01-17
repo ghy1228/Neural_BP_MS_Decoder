@@ -7,13 +7,14 @@ from torch.utils.data import Dataset
 class CodeParam:
     """Holds LDPC code parameters and protograph info."""
     def __init__(
-        self, N, M, E, code_rate, 
+        self, H,N, M, E, code_rate, 
         CN_deg, VN_deg, cn_max_deg, 
         cn_to_edge, vn_to_edge,
         edge_to_VN, edge_to_CN, edge_to_ext_edge,
         M_proto, N_proto, E_proto, 
         z_value, proto_matrix
     ):
+        self.h_matrix = H
         self.N = N
         self.M = M
         self.E = E
@@ -110,6 +111,7 @@ def init_parameter(filename, z_factor, CN_mode):
 
     
     return CodeParam(
+        H=H,
         N=N, M=M, E=E, code_rate=code_rate,
         CN_deg=CN_deg, VN_deg=VN_deg, cn_max_deg = cn_max_deg,
         cn_to_edge=cn_to_edge, vn_to_edge=vn_to_edge,
