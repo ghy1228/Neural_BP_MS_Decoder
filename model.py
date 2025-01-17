@@ -3,29 +3,13 @@ import torch
 import torch.nn as nn
 import math
 import pdb
+import os, logging
+import numpy as np
 
-class SignSTE(torch.autograd.Function):
-    """
-    Sign with a custom backward pass:
-      forward: sign(x)
-      backward: grad = 2/(1 + exp(-x)) - 1
-    """
-    @staticmethod
-    def forward(ctx, x):
-        ctx.save_for_backward(x)
-        return (x >= 0).float()
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        (x,) = ctx.saved_tensors
-        grad_x = 2.0 / (1.0 + torch.exp(-x)) - 1.0
-        return grad_output * grad_x
 
 class LDPCNetwork(nn.Module):
     """
     Simple LDPC decoder example.
-      - loss_option: 0 -> BCE, 1 -> soft-BER, 2 -> FER with STE
-      - loss_type:   0 -> average all iterations, 1 -> last iteration only
       - sharing:     [cn_weight_sharing, ucn_weight_sharing, ch_weight_sharing]
       - cn_mode:     'sequential' (for-loop per CN) or 'parallel' (use edge_to_ext_edge).
     """
@@ -39,6 +23,7 @@ class LDPCNetwork(nn.Module):
         self.z_factor = code_param.z_value
 
         # Basic index arrays (on GPU)
+        self.h_matrix   = torch.from_numpy(code_param.h_matrix).float().to(self.device)
         self.edge_to_vn = torch.from_numpy(code_param.edge_to_VN).long().to(self.device)
         self.edge_to_cn = torch.from_numpy(code_param.edge_to_CN).long().to(self.device)
         self.cn_to_edge = code_param.cn_to_edge
@@ -61,11 +46,12 @@ class LDPCNetwork(nn.Module):
         self.init_ch_weight = args.init_ch_weight
         self.iters_max   = args.iters_max
         self.clip_llr    = args.clip_llr
-        self.loss_option = args.loss_option
-        self.loss_type   = args.loss_type
+        self.loss_function = args.loss_function
+        self.loss_option   = args.loss_option
         self.decoding_type = args.decoding_type
         self.batch_size  = args.batch_size
         self.sharing     = args.sharing
+        self.systematic  = args.systematic
 
         # Initialize optional learnable weights
         self.cn_weight  = self._init_weight(self.sharing[0], prefix="cn")
@@ -86,6 +72,10 @@ class LDPCNetwork(nn.Module):
                 w = torch.ones(self.iters_max, self.M_proto, device=self.device) * self.init_cn_weight
             elif s_val == 3:
                 w = torch.ones(self.iters_max, device=self.device) * self.init_cn_weight
+            elif s_val == 4:
+                w = torch.ones(self.E_proto, device=self.device) * self.init_cn_weight
+            elif s_val == 5:
+                w = torch.ones(self.M_proto, device=self.device) * self.init_cn_weight
             else:
                 return None
         elif prefix == "ch":
@@ -93,6 +83,8 @@ class LDPCNetwork(nn.Module):
                 w = torch.ones(self.iters_max, self.N_proto, device=self.device) * self.init_ch_weight
             elif s_val == 3:
                 w = torch.ones(self.iters_max, device=self.device) * self.init_ch_weight
+            elif s_val == 5:
+                w = torch.ones(self.N_proto, device=self.device) * self.init_cn_weight
             else:
                 return None
         else:
@@ -104,21 +96,22 @@ class LDPCNetwork(nn.Module):
         Main decoding loop for iters_max iterations.
         Returns the final decoded LLR if requested.
         """
-        bsz = llr_in.size(0)
-        v2c_llr = torch.zeros(bsz, self.E, device=self.device)
-        c2v_llr = torch.zeros(bsz, self.E, device=self.device)
-        sum_llr = torch.zeros(bsz, self.N, device=self.device)
+        v2c_llr = torch.zeros(self.batch_size, self.E, device=self.device)
+        c2v_llr = torch.zeros(self.batch_size, self.E, device=self.device)
+        sum_llr = torch.zeros(self.batch_size, self.N, device=self.device)
+        dec_llr = llr_in
 
         dec_llr_list = []
         for it in range(self.iters_max):
+            syndrome = self._get_syndrome(dec_llr)
             # Optional channel-weight application
             w_ch = self._apply_ch_weight(llr_in, it)
 
             # VN update
-            v2c_llr = self._vn_update(w_ch, v2c_llr, c2v_llr, sum_llr)
+            v2c_llr = self._vn_update(w_ch, c2v_llr, sum_llr)
 
             # CN update (SP or MS), either parallel or sequential
-            if self.decoding_type == 0:  # SP
+            if self.decoding_type == 'SP':  # SP
                 if self.cn_mode == 'parallel':
                     c2v_unweighted = self._cn_update_SP_par(v2c_llr)
                 else:
@@ -130,7 +123,8 @@ class LDPCNetwork(nn.Module):
                     c2v_unweighted = self._cn_update_MS_seq(v2c_llr)
 
             # Optional CN weighting and sum of CN->VN messages
-            c2v_llr = self._apply_cn_weight(c2v_unweighted, it)
+            c2v_llr = self._apply_cn_weight(c2v_unweighted, it, syndrome)
+            #pdb.set_trace()
             sum_llr = self._compute_sum_llr(c2v_llr, sum_llr)
 
             # Hard-decision LLR for output
@@ -149,47 +143,69 @@ class LDPCNetwork(nn.Module):
         if self.ch_weight is None:
             return llr_in
         s_val = self.sharing[2]
-        if s_val == 2:
+        if s_val == 2 or s_val == 5:
             v = torch.arange(self.N, device=self.device)
-            proto_col = v // (self.N // self.N_proto)
-            w_iter = self.ch_weight[it_idx, proto_col]
-            w_iter = w_iter.unsqueeze(0).expand(llr_in.size(0), -1)
+            proto_col = v // (self.z_factor)
+            if s_val == 2:
+                w_iter = self.ch_weight[it_idx, proto_col]
+                w_iter = w_iter.unsqueeze(0).expand(llr_in.size(0), -1)
+            else:
+                w_iter = self.ch_weight[proto_col]
+                w_iter = w_iter.unsqueeze(0).expand(llr_in.size(0), -1)
             return llr_in * w_iter
         elif s_val == 3:
             scalar = self.ch_weight[it_idx]
             return llr_in * scalar
+        
         return llr_in
 
-    def _apply_cn_weight(self, c2v_llr, it_idx):
+    def _apply_cn_weight(self, c2v_llr, it_idx, syndrome):
         """
         Apply CN weights if sharing is enabled.
         Clamps final LLR within [-clip_llr, clip_llr].
         """
-        if self.cn_weight is None:
-            return c2v_llr
-        s_val = self.sharing[0]
-        if s_val == 1:
-            w_edge = self.cn_weight[it_idx, :]   # shape = [E_proto]
-            w_edge = torch.repeat_interleave(w_edge, repeats=self.z_factor, dim=0)
-            w_edge = w_edge.unsqueeze(0).expand(c2v_llr.size(0), -1)
-            return torch.clamp(c2v_llr * w_edge, -self.clip_llr, self.clip_llr)
-        elif s_val == 2:
-            proto_row = self.edge_to_cn // self.z_factor
-            w_m = self.cn_weight[it_idx, proto_row]
-            w_m = w_m.unsqueeze(0).expand(c2v_llr.size(0), -1)
-            return torch.clamp(c2v_llr * w_m, -self.clip_llr, self.clip_llr)
-        elif s_val == 3:
-            scalar = self.cn_weight[it_idx]
-            return torch.clamp(c2v_llr * scalar, -self.clip_llr, self.clip_llr)
-        return c2v_llr
 
-    def _apply_ucn_weight(self, c2v_llr, it_idx):
-        """
-        (Optional) for extended weighting. Currently not used.
-        """
-        return c2v_llr
+        def compute_weight(sharing_type, weight, iter, edge_to_cn):
+            if sharing_type == 1:
+                return weight[iter]
+            elif sharing_type == 2:
+                return weight[iter][edge_to_cn]
+            elif sharing_type == 3:
+                return weight[iter].view(1, 1)
+            elif sharing_type == 4:
+                return weight
+            elif sharing_type == 5:
+                return weight[edge_to_cn]
+            else:
+                return torch.ones_like(c2v_llr)
 
-    def _vn_update(self, w_ch, v2c_llr, c2v_llr, sum_llr):
+        c2v_new = c2v_llr.clone()
+        edge_to_cn_proto = self.edge_to_cn // self.z_factor
+        if self.cn_weight is not None and self.ucn_weight is not None:
+            syn_e = syndrome[:, self.edge_to_cn]
+            
+            # Compute weights for synd=0 and synd=1
+            w_edge_0 = compute_weight(self.sharing[0], self.cn_weight, it_idx, edge_to_cn_proto)
+            w_edge_1 = compute_weight(self.sharing[1], self.ucn_weight, it_idx, edge_to_cn_proto)
+            
+        
+            # Combine weights based on syndromes
+            mask_1 = (syn_e == 1).float()
+            mask_0 = 1.0 - mask_1
+            w_edge = w_edge_0 * mask_0 + w_edge_1 * mask_1
+            c2v_new *= w_edge
+
+        elif self.cn_weight is not None:
+            w_edge = compute_weight(self.sharing[0], self.cn_weight, it_idx, edge_to_cn_proto)
+            c2v_new *= w_edge
+
+
+        # Clamp the result
+        c2v_new = torch.clamp(c2v_new, -self.clip_llr, self.clip_llr)
+        return c2v_new
+
+
+    def _vn_update(self, w_ch, c2v_llr, sum_llr):
         """
         VN update: v2c_llr = (channel LLR + sum of other c2v) - current c2v.
         Clamps at clip_llr.
@@ -334,6 +350,15 @@ class LDPCNetwork(nn.Module):
         nxt = torch.zeros_like(sum_llr)
         nxt.index_add_(1, self.edge_to_vn, c2v_llr)
         return nxt
+    
+    def _get_syndrome(self,dec_llr):
+        if self.sharing[1] is not None:
+            dec_bit = (dec_llr < 0).float()
+            syndrome = torch.fmod(torch.matmul(dec_bit,self.h_matrix.T),2)
+            return syndrome
+        else:
+            return None
+        
 
     def _decision(self, llr_in, c2v_llr):
         """
@@ -354,36 +379,131 @@ class LDPCNetwork(nn.Module):
         losses = []
         for dec_llr in dec_llr_list:
             losses.append(self._compute_loss_one_iter(dec_llr))
-        if self.loss_type == 0:
+        if self.loss_option == 'multi':
             return torch.stack(losses, dim=0).mean()
-        return losses[-1]
+        else:
+            return losses[-1]
 
     def _compute_loss_one_iter(self, dec_llr):
         """
-        Compute one-iteration loss:
-          0 -> BCE
-          1 -> soft-BER
-          2 -> FER (with STE)
+        Compute loss for one iteration, considering only the systematic bits
+        if self.systematic is 'on'.
         """
-        if self.loss_option == 0:  # BCE
+        if hasattr(self, 'systematic') and self.systematic == 'on':
+            # Select only the first self.N - self.M values for each batch
+            dec_llr = dec_llr[:, :self.N - self.M]
+
+        if self.loss_function == 'BCE':
+            # Binary Cross-Entropy Loss
             return -torch.log(1.0 - torch.sigmoid(-dec_llr) + 1e-12).mean()
-        elif self.loss_option == 1:  # soft-BER
+        elif self.loss_function == 'Soft_BER':
+            # Soft Bit Error Rate
             return torch.sigmoid(-dec_llr).mean()
-        elif self.loss_option == 2:  # FER + STE
+        elif self.loss_function == 'FER':
+            # Frame Error Rate with Straight-Through Estimator (STE)
             min_val = torch.min(dec_llr, dim=1).values
-            sign_val = SignSTE.apply(min_val)
-            fer = 0.5 * (1.0 - sign_val)
+            sign_val = torch.sign(min_val)
+            inv_exp_val = 2.0 / (1.0 + torch.exp(-min_val)) - 1.0
+            # Forward uses sign, backward uses inv_exp
+            ste_val = inv_exp_val + (sign_val - inv_exp_val).detach()
+
+            fer = 0.5 * (1.0 - ste_val)
             return fer.mean()
         else:
+            # Default to zero loss if no valid loss function is specified
             return torch.zeros(1, device=dec_llr.device)
+
 
     def clamp_weights(self):
         """
-        Optimizer step 이후에 각 파라미터를 특정 범위로 clamp.
+        weights clamp.
         """
+        # 1) cn_weight, ch_weight, cnd_weight, chd_weight: [0, 2]
         if self.cn_weight is not None:
-            self.cn_weight.data.clamp_(0.0, 3.0)
+            self.cn_weight.data.clamp_(0.0, 2.0)
         if self.ucn_weight is not None:
-            self.ucn_weight.data.clamp_(0.0, 3.0)
+            self.ucn_weight.data.clamp_(0.0, 2.0)
         if self.ch_weight is not None:
-            self.ch_weight.data.clamp_(0.0, 3.0)
+            self.ch_weight.data.clamp_(0.0, 2.0)
+
+
+    def load_init_weights_from_file(net, args):
+    
+        path = f"./Weights/{args.filename}_In_Weight_Iter{args.iters_max}.txt"
+        if not os.path.exists(path):
+            logging.warning(f"No init weight file: {path}. Using default init=1.")
+            return
+
+        logging.info(f"Loading initial weights from {path}")
+        with open(path, "r") as f:
+            lines = [line.strip() for line in f]
+
+        weight_dict = {
+            "cn_weight":   None,
+            "ucn_weight":   None,
+            "ch_weight":   None,
+        }
+
+        idx = 0
+        current_key = None
+        buffer_list = []
+        
+        while idx < len(lines):
+            line = lines[idx]
+            idx += 1
+
+            if line.endswith(":"):
+                current_key = line.replace(":", "")
+                buffer_list = []
+            elif line == "":
+                if current_key and buffer_list:
+                    arr = np.array(buffer_list, dtype=np.float32)
+                    weight_dict[current_key] = arr
+                buffer_list = []
+            elif line != "None":
+                floats = list(map(float, line.split('\t')))
+                buffer_list.append(floats)
+
+        if buffer_list and current_key:
+            arr = np.array(buffer_list, dtype=np.float32)
+            weight_dict[current_key] = arr
+
+        for name_str, arr in weight_dict.items():
+            param = getattr(net, name_str, None)
+            if arr is None:
+                setattr(net, name_str, None)
+            else:
+                if param is not None:
+                    p_data = param.data
+                    
+                    if arr.size == p_data.numel():
+                        arr = arr.reshape(p_data.shape)
+
+                    if p_data.shape == arr.shape:
+                        p_data.copy_(torch.from_numpy(arr))
+                    else:
+                        logging.warning(f"Shape mismatch for {name_str}. "
+                                        f"Expected {p_data.shape}, got {arr.shape}.")
+
+    def freeze_first_iters(net, args):
+        f_iter = args.fixed_iter
+        if f_iter <= 0:
+            return
+
+        for w_name in ["cn_weight", "ucn_weight", "ch_weight"]:
+            w_param = getattr(net, w_name, None)
+            if w_param is None:
+                continue
+
+            if w_param.ndim == 2:
+                w_param.requires_grad = True
+                def hook_fn(grad, fi=f_iter):
+                    grad[:fi, :] = 0
+                    return grad
+                w_param.register_hook(hook_fn)
+            elif w_param.ndim == 1:
+                w_param.requires_grad = True
+                def hook_fn(grad, fi=f_iter):
+                    grad[:fi] = 0
+                    return grad
+                w_param.register_hook(hook_fn)
