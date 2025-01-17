@@ -165,28 +165,30 @@ class LDPCNetwork(nn.Module):
         Clamps final LLR within [-clip_llr, clip_llr].
         """
 
-        def compute_weight(sharing_type, weight, iter, edge_to_cn):
+        def compute_weight(sharing_type, weight, iter, edge_proto, edge_to_cn):
             if sharing_type == 1:
-                return weight[iter]
+                return weight[iter][edge_proto]
             elif sharing_type == 2:
                 return weight[iter][edge_to_cn]
             elif sharing_type == 3:
-                return weight[iter].view(1, 1)
+                return weight[iter][edge_proto].view(1, 1)
             elif sharing_type == 4:
-                return weight
+                return weight[edge_proto]
             elif sharing_type == 5:
                 return weight[edge_to_cn]
             else:
                 return torch.ones_like(c2v_llr)
 
+        
         c2v_new = c2v_llr.clone()
         edge_to_cn_proto = self.edge_to_cn // self.z_factor
+        edge_proto = torch.arange(self.E, device=self.device) // (self.z_factor)
         if self.cn_weight is not None and self.ucn_weight is not None:
             syn_e = syndrome[:, self.edge_to_cn]
             
             # Compute weights for synd=0 and synd=1
-            w_edge_0 = compute_weight(self.sharing[0], self.cn_weight, it_idx, edge_to_cn_proto)
-            w_edge_1 = compute_weight(self.sharing[1], self.ucn_weight, it_idx, edge_to_cn_proto)
+            w_edge_0 = compute_weight(self.sharing[0], self.cn_weight, it_idx, edge_proto, edge_to_cn_proto)
+            w_edge_1 = compute_weight(self.sharing[1], self.ucn_weight, it_idx, edge_proto, edge_to_cn_proto)
             
         
             # Combine weights based on syndromes
@@ -196,7 +198,7 @@ class LDPCNetwork(nn.Module):
             c2v_new *= w_edge
 
         elif self.cn_weight is not None:
-            w_edge = compute_weight(self.sharing[0], self.cn_weight, it_idx, edge_to_cn_proto)
+            w_edge = compute_weight(self.sharing[0], self.cn_weight, it_idx, edge_proto, edge_to_cn_proto)
             c2v_new *= w_edge
 
 
