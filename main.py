@@ -20,30 +20,6 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-def _setup_logger(perf_path):
-    """
-    Set up a logger that writes to both console and perf_path file.
-    """
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-
-    # Clear any existing handlers (optional)
-    if logger.hasHandlers():
-        logger.handlers.clear()
-
-    # Log format
-    formatter = logging.Formatter("%(message)s")
-
-    # 1) StreamHandler -> console
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-
-    # 2) FileHandler -> perf file
-    file_handler = logging.FileHandler(perf_path, mode='w')
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-
 def save_model_weights(net, args, current_time, best):
     """Example: save learned weights to a text file (optional)."""
     os.makedirs("./Weights", exist_ok=True)
@@ -218,9 +194,18 @@ def setup_environment(args):
     # Generate current time string for unique perf_path
     current_time = datetime.now().strftime("%m%d_%H%M%S")
     perf_path = f"./Weights/{current_time}_{args.filename}_Performance.txt"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(perf_path, mode='w')
+        ]
+    )
 
-    # Setup logger
-    _setup_logger(perf_path)
+    for k, v in vars(args).items():
+        logging.info(f"{k}={v}")
+    logging.info("")
 
     # Prepare device
     device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
@@ -275,8 +260,8 @@ if __name__ == "__main__":
     parser.add_argument('--filename', type=str, default='wman_N0576_R34_z24')
     parser.add_argument('--z_factor', type=int, default=24)
     parser.add_argument('--clip_llr', type=float, default=20)
-    parser.add_argument('--decoding_type', type=str, default='MS', choices=['SP','MS'])
-    parser.add_argument('--sharing', nargs='+', type=int, default=[1,0,2]) #[cn_weight,ucn_weight,ch_weight], 1: Edges/Iters 2: Node/Iter 3: Iter, 4: Edge, 5: Node
+    parser.add_argument('--decoding_type', type=str, default='SP', choices=['SP','MS'])
+    parser.add_argument('--sharing', nargs='+', type=int, default=[3,0,3]) #[cn_weight,ucn_weight,ch_weight], 1: Edges/Iters 2: Node/Iter 3: Iter, 4: Edge, 5: Node
     parser.add_argument('--iters_max', type=int, default=20)
     parser.add_argument('--fixed_iter', type=int, default=0)
     parser.add_argument('--systematic', type=str, default='off', choices=['off', 'on'])
