@@ -171,7 +171,7 @@ class LDPCNetwork(nn.Module):
             elif sharing_type == 2:
                 return weight[iter][edge_to_cn]
             elif sharing_type == 3:
-                return weight[iter][edge_proto].view(1, 1)
+                return weight[iter]
             elif sharing_type == 4:
                 return weight[edge_proto]
             elif sharing_type == 5:
@@ -182,7 +182,7 @@ class LDPCNetwork(nn.Module):
         
         c2v_new = c2v_llr.clone()
         edge_to_cn_proto = self.edge_to_cn // self.z_factor
-        edge_proto = torch.arange(self.E, device=self.device) // (self.z_factor)
+        edge_proto = torch.arange(self.E, device=self.device) // (self.z_factor) #Proto Sharing
         if self.cn_weight is not None and self.ucn_weight is not None:
             syn_e = syndrome[:, self.edge_to_cn]
             
