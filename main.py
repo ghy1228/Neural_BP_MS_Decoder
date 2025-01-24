@@ -36,7 +36,7 @@ def save_model_weights(net, args, current_time, best):
 
 def _write_weight(f, w_param, name_str):
     if w_param is None:
-        f.write(f"{name_str}: None\n\n")
+        f.write(f"None\n\n")
         return
     arr = w_param.detach().cpu().numpy()
     f.write(f"{name_str}:\n")
