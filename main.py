@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 from datetime import datetime
 from model import LDPCNetwork
 from data import CustomDataset, init_parameter, create_random_samples, read_uncor_sample
+import pdb
 
 # Global samples if sampling_type='Read'
 GLOBAL_TRAIN_SAMPLES = None
@@ -36,6 +37,7 @@ def save_model_weights(net, args, current_time, best):
 
 def _write_weight(f, w_param, name_str):
     if w_param is None:
+        #f.write(f"{name_str}: None\n\n")
         f.write(f"None\n\n")
         return
     arr = w_param.detach().cpu().numpy()
@@ -48,6 +50,7 @@ def _write_weight(f, w_param, name_str):
             line = "\t".join(f"{x:.6f}" for x in row)
             f.write(line + "\n")
         f.write("\n")
+
 
 def run_validation(args, net, code_param, device, rng, epoch):
     """
@@ -78,7 +81,7 @@ def run_validation(args, net, code_param, device, rng, epoch):
         return 0.0
 
     ds_val = CustomDataset(llrs_valid)
-    loader_val = DataLoader(ds_val, batch_size=args.batch_size, shuffle=False)
+    loader_val = DataLoader(ds_val, batch_size=args.batch_size, shuffle=False, drop_last=True)
 
     total_loss = 0.0
     total_count = 0
@@ -112,16 +115,16 @@ def run_validation(args, net, code_param, device, rng, epoch):
 
     avg_loss = total_loss / total_count if total_count else 0.0
     elapsed  = time.time() - start_time
-    logging.info(f"[Epoch {epoch}] valid loss={avg_loss:.4f}, valid time={elapsed:.2f}s")
+    logging.info(f"[Epoch {epoch}] valid loss {avg_loss:.4f}, valid time {elapsed:.2f}s")
 
     # Print SNR-based stats
     for i, snr_val in enumerate(args.SNR_array):
         if samp_snr[i] == 0:
-            logging.info(f"SNR={snr_val:.3f} BER=0.00 FER=0.00")
+            logging.info(f"SNR {snr_val:.3f} BER 0.00 FER 0.00")
             continue
         ber = bit_err_snr[i]/ bit_snr[i]
         fer = frm_err_snr[i]/ samp_snr[i]
-        logging.info(f"SNR={snr_val:.3f} BER={ber:.2e} FER={fer:.2e}")
+        logging.info(f"SNR {snr_val:.3f} BER {ber:.2e} FER {fer:.2e}") 
 
     return avg_loss
 
@@ -153,7 +156,7 @@ def run_training(args, net, code_param, device, rng, epoch):
         return 0.0
 
     ds_train = CustomDataset(llrs_train)
-    loader_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True)
+    loader_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=False, drop_last=True)
     optimizer = torch.optim.Adam(net.parameters(), lr=args.learn_rate)
 
     total_loss = 0.0
@@ -257,12 +260,12 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--gpu_id', type=int, default=0)
-    parser.add_argument('--filename', type=str, default='wman_N0576_R34_z24')
-    parser.add_argument('--z_factor', type=int, default=24)
+    parser.add_argument('--filename', type=str, default='BCH_65_45')
+    parser.add_argument('--z_factor', type=int, default=1)
     parser.add_argument('--clip_llr', type=float, default=20)
     parser.add_argument('--decoding_type', type=str, default='SP', choices=['SP','MS'])
-    parser.add_argument('--sharing', nargs='+', type=int, default=[3,0,3]) #[cn_weight,ucn_weight,ch_weight], 1: Edges/Iters 2: Node/Iter 3: Iter, 4: Edge, 5: Node
-    parser.add_argument('--iters_max', type=int, default=20)
+    parser.add_argument('--sharing', nargs='+', type=int, default=[4,0,0]) #[cn_weight,ucn_weight,ch_weight], 1: Edges/Iters 2: Node/Iter 3: Iter, 4: Edge, 5: Node
+    parser.add_argument('--iters_max', type=int, default=5)
     parser.add_argument('--fixed_iter', type=int, default=0)
     parser.add_argument('--systematic', type=str, default='off', choices=['off', 'on'])
 
@@ -274,16 +277,16 @@ if __name__ == "__main__":
                         choices=['sequential', 'parallel'],
                         help='Choose the CN update mode: sequential or parallel') 
 
-    parser.add_argument('--loss_option', type=str, default='last', choices = ['multi', 'last'])
-    parser.add_argument('--loss_function', type=str, default='FER', choices=['BCE', 'Soft_BER', 'FER'])    
+    parser.add_argument('--loss_option', type=str, default='multi', choices = ['multi', 'last'])
+    parser.add_argument('--loss_function', type=str, default='BCE', choices=['BCE', 'Soft_BER', 'FER'])    
 
     parser.add_argument('--sampling_type', type=str, default='Random',choices=['Random','Read','Collect']) #'Collect"is not yet implemented.
     parser.add_argument('--SNR_array', nargs='+', type=float, 
-                        default=[2,2.5,3.0,3.5,4.0])
+                        default=[1,2,3,4,5,6,7,8])
     parser.add_argument('--batch_size', type=int, default=100)
     parser.add_argument('--training_num', type=int, default=10000)
-    parser.add_argument('--valid_num', type=int, default=10000)
-    parser.add_argument('--epoch_input', type=int, default=100)
+    parser.add_argument('--valid_num', type=int, default=80000)
+    parser.add_argument('--epoch_input', type=int, default=200)
     parser.add_argument('--learn_rate', type=float, default=1e-3)
     parser.add_argument('--seed_in', type=int, default=42)
     
