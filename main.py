@@ -274,8 +274,8 @@ if __name__ == "__main__":
     parser.add_argument('--systematic', type=str, default='off', choices=['off', 'on'])
     
 
-    parser.add_argument('--init_cn_weight', type=int, default=-1) #-1: random values from normal distribution
-    parser.add_argument('--init_ch_weight', type=int, default=-1)
+    parser.add_argument('--init_cn_weight', type=int, default=1) #-1: random values from normal distribution
+    parser.add_argument('--init_ch_weight', type=int, default=1)
     parser.add_argument('--init_cn_bias', type=int, default=0)
     parser.add_argument('--input_weight', type=str, default='none', choices=['none','input'])
 
