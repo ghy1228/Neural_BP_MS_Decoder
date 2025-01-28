@@ -34,6 +34,8 @@ def save_model_weights(net, args, current_time, best):
         _write_weight(f, net.cn_weight,  "cn_weight")
         _write_weight(f, net.ucn_weight, "ucn_weight")
         _write_weight(f, net.ch_weight,  "ch_weight")
+        _write_weight(f, net.cn_bias,  "cn_bias")
+        _write_weight(f, net.ucn_bias,  "ucn_bias")
 
 def _write_weight(f, w_param, name_str):
     if w_param is None:
@@ -205,7 +207,7 @@ def setup_environment(args):
             logging.FileHandler(perf_path, mode='w')
         ]
     )
-
+    logging.info("<------------- Arguments ------------->")
     for k, v in vars(args).items():
         logging.info(f"{k}={v}")
     logging.info("")
@@ -213,7 +215,8 @@ def setup_environment(args):
     # Prepare device
     device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
     logging.info(f"Device: {device}")
-
+    logging.info("<========================================>")
+    logging.info("")
     # Initialize RNG
     rng = np.random.RandomState(args.seed_in)
 
@@ -260,29 +263,32 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--gpu_id', type=int, default=0)
-    parser.add_argument('--filename', type=str, default='BCH_65_45')
-    parser.add_argument('--z_factor', type=int, default=1)
+    parser.add_argument('--filename', type=str, default='wman_N0576_R34_z24')
+    parser.add_argument('--z_factor', type=int, default=24)
     parser.add_argument('--clip_llr', type=float, default=20)
-    parser.add_argument('--decoding_type', type=str, default='SP', choices=['SP','MS'])
-    parser.add_argument('--sharing', nargs='+', type=int, default=[4,0,0]) #[cn_weight,ucn_weight,ch_weight], 1: Edges/Iters 2: Node/Iter 3: Iter, 4: Edge, 5: Node
-    parser.add_argument('--iters_max', type=int, default=5)
+    parser.add_argument('--decoding_type', type=str, default='QMS', choices=['SP','MS', 'QMS'])
+    parser.add_argument('--q_bit', type=int, default=5) # 0: Floating operation, >=1: Quantization
+    parser.add_argument('--sharing', nargs='+', type=int, default=[3,0,3,0,0]) #[cn_weight,ucn_weight,ch_weight,cn_bias,ucn_bias], 1: Edges/Iters 2: Node/Iter 3: Iter, 4: Edge, 5: Node
+    parser.add_argument('--iters_max', type=int, default=20)
     parser.add_argument('--fixed_iter', type=int, default=0)
     parser.add_argument('--systematic', type=str, default='off', choices=['off', 'on'])
+    
 
     parser.add_argument('--init_cn_weight', type=int, default=1)
     parser.add_argument('--init_ch_weight', type=int, default=1)
+    parser.add_argument('--init_cn_bias', type=int, default=0)
     parser.add_argument('--input_weight', type=str, default='none', choices=['none','input'])
 
     parser.add_argument('--cn_mode', type=str, default='parallel',
                         choices=['sequential', 'parallel'],
                         help='Choose the CN update mode: sequential or parallel') 
 
-    parser.add_argument('--loss_option', type=str, default='multi', choices = ['multi', 'last'])
-    parser.add_argument('--loss_function', type=str, default='BCE', choices=['BCE', 'Soft_BER', 'FER'])    
+    parser.add_argument('--loss_option', type=str, default='last', choices = ['multi', 'last'])
+    parser.add_argument('--loss_function', type=str, default='FER', choices=['BCE', 'Soft_BER', 'FER'])    
 
     parser.add_argument('--sampling_type', type=str, default='Random',choices=['Random','Read','Collect']) #'Collect"is not yet implemented.
     parser.add_argument('--SNR_array', nargs='+', type=float, 
-                        default=[1,2,3,4,5,6,7,8])
+                        default=[2,2.5,3.0,3.5,4.0])
     parser.add_argument('--batch_size', type=int, default=100)
     parser.add_argument('--training_num', type=int, default=10000)
     parser.add_argument('--valid_num', type=int, default=80000)
