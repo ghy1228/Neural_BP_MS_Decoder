@@ -21,7 +21,7 @@ class LDPCNetwork(nn.Module):
         self.M = code_param.M
         self.E = code_param.E
         self.z_factor = code_param.z_value
-
+        
         # Basic index arrays (on GPU)
         self.h_matrix   = torch.from_numpy(code_param.h_matrix).float().to(self.device)
         self.edge_to_vn = torch.from_numpy(code_param.edge_to_VN).long().to(self.device)
@@ -31,6 +31,7 @@ class LDPCNetwork(nn.Module):
 
         # cn_mode controls how the CN update is done: 'parallel' or 'sequential'
         self.cn_mode = args.cn_mode
+        
 
         # If parallel, we have an index list edge_to_ext_edge (E x (d_max-1))
         if self.cn_mode == 'parallel':
@@ -42,8 +43,10 @@ class LDPCNetwork(nn.Module):
         self.M_proto = code_param.M_proto
         self.E_proto = code_param.E_proto
 
+        self.q_bit = args.q_bit
         self.init_cn_weight = args.init_cn_weight
         self.init_ch_weight = args.init_ch_weight
+        self.init_cn_bias  = args.init_cn_bias
         self.iters_max   = args.iters_max
         self.clip_llr    = args.clip_llr
         self.loss_function = args.loss_function
@@ -57,6 +60,8 @@ class LDPCNetwork(nn.Module):
         self.cn_weight  = self._init_weight(self.sharing[0], prefix="cn")
         self.ucn_weight = self._init_weight(self.sharing[1], prefix="ucn")
         self.ch_weight  = self._init_weight(self.sharing[2], prefix="ch")
+        self.cn_bias  = self._init_weight(self.sharing[3], prefix="cn_b")
+        self.ucn_bias = self._init_weight(self.sharing[4], prefix="ucn_b")
 
     def _init_weight(self, s_val, prefix):
         """
@@ -76,6 +81,19 @@ class LDPCNetwork(nn.Module):
                 w = torch.ones(self.E_proto, device=self.device) * self.init_cn_weight
             elif s_val == 5:
                 w = torch.ones(self.M_proto, device=self.device) * self.init_cn_weight
+            else:
+                return None
+        elif prefix in ["cn_b", "ucn_b"]:
+            if   s_val == 1:
+                w = torch.ones(self.iters_max, self.E_proto, device=self.device) * self.init_cn_bias
+            elif s_val == 2:
+                w = torch.ones(self.iters_max, self.M_proto, device=self.device) * self.init_cn_bias
+            elif s_val == 3:
+                w = torch.ones(self.iters_max, device=self.device) * self.init_cn_bias
+            elif s_val == 4:
+                w = torch.ones(self.E_proto, device=self.device) * self.init_cn_bias
+            elif s_val == 5:
+                w = torch.ones(self.M_proto, device=self.device) * self.init_cn_bias
             else:
                 return None
         elif prefix == "ch":
@@ -109,6 +127,8 @@ class LDPCNetwork(nn.Module):
 
             # VN update
             v2c_llr = self._vn_update(w_ch, c2v_llr, sum_llr)
+            v2c_llr = self._quantize_llr(v2c_llr, self.q_bit)
+            
 
             # CN update (SP or MS), either parallel or sequential
             if self.decoding_type == 'SP':  # SP
@@ -123,8 +143,9 @@ class LDPCNetwork(nn.Module):
                     c2v_unweighted = self._cn_update_MS_seq(v2c_llr)
 
             # Optional CN weighting and sum of CN->VN messages
-            c2v_llr = self._apply_cn_weight(c2v_unweighted, it, syndrome)
-            #pdb.set_trace()
+            c2v_llr_w = self._apply_cn_weight(c2v_unweighted, it, syndrome)
+            c2v_llr_wb = self._apply_cn_bias(c2v_llr_w, it, syndrome)
+            c2v_llr = self._quantize_llr(c2v_llr_wb, self.q_bit)
             sum_llr = self._compute_sum_llr(c2v_llr, sum_llr)
 
             # Hard-decision LLR for output
@@ -135,7 +156,21 @@ class LDPCNetwork(nn.Module):
         if return_dec_llr:
             return loss_val, dec_llr_list[-1]
         return loss_val
-
+    
+    def _quantize_llr(self, llr, q_bit, step_size=0.5):
+        """
+        Quantize LLR values based on q_bit.
+        If q_bit == 0, perform clipping using self.clip_llr.
+        If q_bit >= 1, perform quantization with step size.
+        """
+        if q_bit == 0:
+            return torch.clamp(llr, -self.clip_llr, self.clip_llr)
+        else:
+            max_val = (2 ** (q_bit - 1) - 1) * step_size
+            min_val = -max_val
+            llr = torch.round(llr / step_size) * step_size  # Apply quantization step
+            llr = torch.clamp(llr, min_val, max_val)  # Re-clip to avoid rounding errors
+            return llr
     def _apply_ch_weight(self, llr_in, it_idx):
         """
         Apply channel (ch) weights if needed (e.g. per-iteration, scalar or proto-based).
@@ -201,10 +236,70 @@ class LDPCNetwork(nn.Module):
             w_edge = compute_weight(self.sharing[0], self.cn_weight, it_idx, edge_proto, edge_to_cn_proto)
             c2v_new *= w_edge
 
-
-        # Clamp the result
-        c2v_new = torch.clamp(c2v_new, -self.clip_llr, self.clip_llr)
         return c2v_new
+    
+    def _apply_cn_bias(self, c2v_llr_w, it_idx, syndrome):
+        """
+        Apply CN bias with given bias parameters and handle different sharing types.
+        Bias is applied as a subtraction, and negative LLRs after bias are set to 0.
+        Handles cases where biases may or may not be provided and adjusts for sharing type.
+        """
+        def compute_bias(sharing_type, bias, edge_proto, edge_to_cn):
+            """
+            Compute bias based on the sharing type.
+            """
+            if sharing_type == 1:
+                return bias[it_idx][edge_proto]  # Iteration and proto-specific bias
+            elif sharing_type == 2:
+                return bias[it_idx][edge_to_cn]  # Iteration and CN-specific bias
+            elif sharing_type == 3:
+                return bias[it_idx]  # Iteration-specific bias
+            elif sharing_type == 4:
+                return bias[edge_proto]  # Proto-specific bias
+            elif sharing_type == 5:
+                return bias[edge_to_cn]  # CN-specific bias
+            else:
+                return torch.zeros_like(c2v_llr_w)  # Default to zero bias if sharing type is invalid
+
+        c2v_new = c2v_llr_w.clone()  # Clone the input tensor to avoid modifying it directly
+        edge_to_cn_proto = self.edge_to_cn // self.z_factor
+        edge_proto = torch.arange(self.E, device=self.device) // self.z_factor  # Proto Sharing
+
+        # Check if biases are provided
+        if self.cn_bias is not None and self.ucn_bias is not None:
+            # Compute biases for synd=0 and synd=1
+            syn_e = syndrome[:, self.edge_to_cn]
+            bias_0 = compute_bias(self.sharing[3], self.cn_bias, edge_proto, edge_to_cn_proto)  # Bias for synd=0
+            bias_1 = compute_bias(self.sharing[4], self.ucn_bias, edge_proto, edge_to_cn_proto)  # Bias for synd=1
+
+            # Combine biases based on syndromes
+            mask_1 = (syn_e == 1).float()
+            mask_0 = 1.0 - mask_1
+            bias = bias_0 * mask_0 + bias_1 * mask_1
+
+        elif self.cn_bias is not None:
+            # Only cn_bias is available
+            bias = compute_bias(self.sharing[3], self.cn_bias, edge_proto, edge_to_cn_proto)
+
+        elif self.ucn_bias is not None:
+            # Only ucn_bias is available
+            syn_e = syndrome[:, self.edge_to_cn]
+            bias = compute_bias(self.sharing[4], self.ucn_bias, edge_proto, edge_to_cn_proto) * (syn_e == 1).float()
+
+        else:
+            # No bias is available, return the input as is
+            return c2v_new
+
+        # Apply biases
+        c2v_abs = torch.abs(c2v_new)  # Compute the absolute value of LLRs
+        c2v_abs = c2v_abs - bias  # Subtract bias
+        c2v_abs = torch.clamp(c2v_abs, min=0)  # Set negative values to 0
+
+        # Restore original sign
+        c2v_new = c2v_abs * torch.sign(c2v_new)
+
+        return c2v_new
+
 
 
     def _vn_update(self, w_ch, c2v_llr, sum_llr):
@@ -216,7 +311,7 @@ class LDPCNetwork(nn.Module):
         wch_g = w_ch.gather(1, v_idx.unsqueeze(0).expand(w_ch.size(0), -1))
         sum_g = sum_llr.gather(1, v_idx.unsqueeze(0).expand(sum_llr.size(0), -1))
         out = wch_g + sum_g - c2v_llr
-        return torch.clamp(out, -self.clip_llr, self.clip_llr)
+        return out
 
     def _cn_update_SP_seq(self, v2c_llr):
         """
@@ -236,7 +331,6 @@ class LDPCNetwork(nn.Module):
             out = p_all.unsqueeze(1) / x
             out = torch.clamp(out, -0.999999, 0.999999)
             out = 2.0 * 0.5 * torch.log((1 + out)/(1 - out + eps))
-            out = torch.clamp(out, -self.clip_llr, self.clip_llr)
             c2v_new[:, edges_c] = out
         return c2v_new
 
@@ -269,8 +363,6 @@ class LDPCNetwork(nn.Module):
 
         out = torch.clamp(prod_ext, -0.999999, 0.999999)
         out = 0.5 * torch.log((1.0 + out)/(1.0 - out + eps)) * 2.0
-        out = torch.clamp(out, -self.clip_llr, self.clip_llr)
-
         c2v_new = out
         return c2v_new
 
@@ -301,8 +393,7 @@ class LDPCNetwork(nn.Module):
             mg = mag1.unsqueeze(1).expand(-1, vals.size(1)).clone()
             mg[row_idx == pos.unsqueeze(1)] = mag2
             s_j = torch.where(vals < 0, -tot_sign.unsqueeze(1), tot_sign.unsqueeze(1))
-            out = torch.clamp(s_j * mg, -self.clip_llr, self.clip_llr)
-            c2v_new[:, edges_c] = out
+            c2v_new[:, edges_c] = s_j * mg
 
         return c2v_new
 
@@ -340,7 +431,6 @@ class LDPCNetwork(nn.Module):
         sign_prod = torch.prod(extrinsic_sgnvals, dim=2)  # => [B, E]
 
         out = min_abs * sign_prod
-        out = torch.clamp(out, -self.clip_llr, self.clip_llr)
 
         c2v_new = out
         return c2v_new
@@ -420,13 +510,18 @@ class LDPCNetwork(nn.Module):
         """
         weights clamp.
         """
-        # 1) cn_weight, ch_weight, cnd_weight, chd_weight: [0, 2]
+        # 1) cn_weight, ch_weight, cnd_weight, chd_weight: [0, 3]
         if self.cn_weight is not None:
-            self.cn_weight.data.clamp_(0.0, 2.0)
+            self.cn_weight.data.clamp_(0.0, 3.0)
         if self.ucn_weight is not None:
-            self.ucn_weight.data.clamp_(0.0, 2.0)
+            self.ucn_weight.data.clamp_(0.0, 3.0)
         if self.ch_weight is not None:
-            self.ch_weight.data.clamp_(0.0, 2.0)
+            self.ch_weight.data.clamp_(0.0, 3.0)
+        if self.cn_bias is not None:
+            self.cn_bias.data.clamp_(-self.clip_llr, self.clip_llr)
+        if self.ucn_bias is not None:
+            self.ucn_bias.data.clamp_(-self.clip_llr, self.clip_llr)
+
 
 
     def load_init_weights_from_file(net, args):
@@ -444,6 +539,8 @@ class LDPCNetwork(nn.Module):
             "cn_weight":   None,
             "ucn_weight":   None,
             "ch_weight":   None,
+            "cn_bias":   None,
+            "ucn_bias":   None,
         }
 
         idx = 0
@@ -492,7 +589,7 @@ class LDPCNetwork(nn.Module):
         if f_iter <= 0:
             return
 
-        for w_name in ["cn_weight", "ucn_weight", "ch_weight"]:
+        for w_name in ["cn_weight", "ucn_weight", "ch_weight","cn_bias","ucn_bias"]:
             w_param = getattr(net, w_name, None)
             if w_param is None:
                 continue
