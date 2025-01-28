@@ -67,11 +67,13 @@ class LDPCNetwork(nn.Module):
         """
         Create learnable weight parameters based on sharing scheme.
         s_val indicates the type of sharing (0=none, 1=per-edge-proto, etc.).
+        If init_weight == -1, apply truncated normal initialization with mean=1 and stddev=0.1.
         """
         if s_val == 0:
             return None
+        
         if prefix in ["cn", "ucn"]:
-            if   s_val == 1:
+            if s_val == 1:
                 w = torch.ones(self.iters_max, self.E_proto, device=self.device) * self.init_cn_weight
             elif s_val == 2:
                 w = torch.ones(self.iters_max, self.M_proto, device=self.device) * self.init_cn_weight
@@ -84,7 +86,7 @@ class LDPCNetwork(nn.Module):
             else:
                 return None
         elif prefix in ["cn_b", "ucn_b"]:
-            if   s_val == 1:
+            if s_val == 1:
                 w = torch.ones(self.iters_max, self.E_proto, device=self.device) * self.init_cn_bias
             elif s_val == 2:
                 w = torch.ones(self.iters_max, self.M_proto, device=self.device) * self.init_cn_bias
@@ -97,16 +99,26 @@ class LDPCNetwork(nn.Module):
             else:
                 return None
         elif prefix == "ch":
-            if   s_val == 2:
+            if s_val == 2:
                 w = torch.ones(self.iters_max, self.N_proto, device=self.device) * self.init_ch_weight
             elif s_val == 3:
                 w = torch.ones(self.iters_max, device=self.device) * self.init_ch_weight
             elif s_val == 5:
-                w = torch.ones(self.N_proto, device=self.device) * self.init_cn_weight
+                w = torch.ones(self.N_proto, device=self.device) * self.init_ch_weight
             else:
                 return None
         else:
             return None
+
+        # Apply truncated normal initialization if init_weight == -1
+        if self.init_cn_weight == -1 or self.init_cn_bias == -1 or self.init_ch_weight == -1:
+            mean = 1.0
+            stddev = 0.1
+
+            # Generate truncated normal values
+            w = torch.empty_like(w)
+            w.normal_(mean=mean, std=stddev)  # Generate normal distribution
+            w = torch.clamp(w, min=mean - 2 * stddev, max=mean + 2 * stddev)  # Truncate values
         return nn.Parameter(w)
 
     def forward(self, llr_in, return_dec_llr=False):
@@ -129,7 +141,6 @@ class LDPCNetwork(nn.Module):
             v2c_llr = self._vn_update(w_ch, c2v_llr, sum_llr)
             v2c_llr = self._quantize_llr(v2c_llr, self.q_bit)
             
-
             # CN update (SP or MS), either parallel or sequential
             if self.decoding_type == 'SP':  # SP
                 if self.cn_mode == 'parallel':
@@ -166,12 +177,15 @@ class LDPCNetwork(nn.Module):
         if q_bit == 0:
             quantized = torch.clamp(llr, -self.clip_llr, self.clip_llr)
         else:
+            
             max_val = (2 ** (q_bit - 1) - 1) * step_size
             min_val = -max_val
+
+            llr_clip = torch.clamp(llr, min_val, max_val) 
             quantized = torch.round(llr / step_size) * step_size  # Apply quantization step
-            quantized = torch.clamp(llr, min_val, max_val) 
+            quantized = torch.clamp(quantized, min_val, max_val) 
         
-        return quantized.detach() + (llr - llr.detach())
+        return llr_clip + (quantized - llr_clip).detach() #foward: quantized, backward: llr
 
     def _apply_ch_weight(self, llr_in, it_idx):
         """
