@@ -164,13 +164,15 @@ class LDPCNetwork(nn.Module):
         If q_bit >= 1, perform quantization with step size.
         """
         if q_bit == 0:
-            return torch.clamp(llr, -self.clip_llr, self.clip_llr)
+            quantized = torch.clamp(llr, -self.clip_llr, self.clip_llr)
         else:
             max_val = (2 ** (q_bit - 1) - 1) * step_size
             min_val = -max_val
-            llr = torch.round(llr / step_size) * step_size  # Apply quantization step
-            llr = torch.clamp(llr, min_val, max_val)  # Re-clip to avoid rounding errors
-            return llr
+            quantized = torch.round(llr / step_size) * step_size  # Apply quantization step
+            quantized = torch.clamp(llr, min_val, max_val) 
+        
+        return quantized.detach() + (llr - llr.detach())
+
     def _apply_ch_weight(self, llr_in, it_idx):
         """
         Apply channel (ch) weights if needed (e.g. per-iteration, scalar or proto-based).
