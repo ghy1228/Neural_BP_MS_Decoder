@@ -122,50 +122,41 @@ class LDPCNetwork(nn.Module):
         return nn.Parameter(w)
 
     def forward(self, llr_in, return_dec_llr=False):
-        """
-        Main decoding loop for iters_max iterations.
-        Returns the final decoded LLR if requested.
-        """
+        
+        llr_in = torch.as_tensor(llr_in, dtype=torch.float, device=self.device)
         v2c_llr = torch.zeros(self.batch_size, self.E, device=self.device)
         c2v_llr = torch.zeros(self.batch_size, self.E, device=self.device)
         sum_llr = torch.zeros(self.batch_size, self.N, device=self.device)
-        dec_llr = llr_in
+        dec_llr = llr_in.clone()
 
-        dec_llr_list = []
+        dec_llr_list = []  # Collect decoded LLRs for each iteration
         for it in range(self.iters_max):
             syndrome = self._get_syndrome(dec_llr)
-            # Optional channel-weight application
             w_ch = self._apply_ch_weight(llr_in, it)
-
-            # VN update
             v2c_llr = self._vn_update(w_ch, c2v_llr, sum_llr)
             v2c_llr = self._quantize_llr(v2c_llr, self.q_bit)
-            
-            # CN update (SP or MS), either parallel or sequential
-            if self.decoding_type == 'SP':  # SP
+            if self.decoding_type == 'SP':
                 if self.cn_mode == 'parallel':
                     c2v_unweighted = self._cn_update_SP_par(v2c_llr)
                 else:
                     c2v_unweighted = self._cn_update_SP_seq(v2c_llr)
-            else:  # MS
+            else:
                 if self.cn_mode == 'parallel':
                     c2v_unweighted = self._cn_update_MS_par(v2c_llr)
                 else:
                     c2v_unweighted = self._cn_update_MS_seq(v2c_llr)
-
-            # Optional CN weighting and sum of CN->VN messages
             c2v_llr_w = self._apply_cn_weight(c2v_unweighted, it, syndrome)
             c2v_llr_wb = self._apply_cn_bias(c2v_llr_w, it, syndrome)
             c2v_llr = self._quantize_llr(c2v_llr_wb, self.q_bit)
             sum_llr = self._compute_sum_llr(c2v_llr, sum_llr)
-
-            # Hard-decision LLR for output
             dec_llr = self._decision(llr_in, c2v_llr)
             dec_llr_list.append(dec_llr)
-
-        loss_val = self._compute_loss_all(dec_llr_list)
+            
+        # Convert list to tensor: shape (iters_max, batch_size, N)
+        dec_llr_tensor = torch.stack(dec_llr_list, dim=0)
+        loss_val = self._compute_loss_all(dec_llr_tensor)
         if return_dec_llr:
-            return loss_val, dec_llr_list[-1]
+            return loss_val, dec_llr_tensor
         return loss_val
     
     def _quantize_llr(self, llr, q_bit, step_size=0.5):
