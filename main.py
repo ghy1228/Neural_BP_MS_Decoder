@@ -298,7 +298,7 @@ def run_validation(args, net, code_param, device, rng, epoch):
         total_loss += loss_sum
         total_count += frame_num
 
-        logging.info(f"SNR {snr_val:.3f}: Frames {frame_num} BER {ber:.2e} FER {fer:.2e} loss {avg_loss_snr:.2e} Avg Iter {avg_stop_iter:.2f}")
+        logging.info(f"SNR {snr_val:.3f}: Frames {frame_num} Uncor_Frames {frame_err} BER {ber:.2e} FER {fer:.2e} loss {avg_loss_snr:.2e} Avg Iter {avg_stop_iter:.2f}")
 
     avg_loss = total_loss / total_count if total_count else 0.0
     elapsed = time.time() - start_time
