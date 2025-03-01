@@ -141,18 +141,3 @@ def create_random_samples(sample_num, code_rate, SNR_array, rng, N):
         llr = (2.0 / noise_var) * rx
         llrs.append(llr)
     return np.array(llrs, dtype=float)
-
-def read_uncor_sample(file_path, num_samples, N, start_idx=0):
-    """Load LLR samples from text file. 
-       Assume the last N columns are LLR data."""
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"{file_path} not found")
-    data_all = np.loadtxt(file_path, dtype=float, delimiter='\t')
-    end_idx = start_idx + num_samples
-    if end_idx > data_all.shape[0]:
-        end_idx = data_all.shape[0]
-    slice_ = data_all[start_idx:end_idx, :]
-    if slice_.shape[1] < N:
-        raise ValueError("File columns < N.")
-    col_start = slice_.shape[1] - N
-    return slice_[:, col_start:]
