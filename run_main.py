@@ -21,5 +21,5 @@ run_main(gpu_id = gpu_id, folder = folder, PCM_name = PCM_name, out_filename = f
          batch_size = 20, training_num = 10000, valid_num = 1000, epoch_input = 10)
 
 # Evaluation
-run_main(gpu_id = gpu_id, folder = folder, PCM_name = PCM_name, in_filename = f'NMS_Iter{iters_max}', out_file = f'NMS_Iter{iters_max}_eval', 
-         batch_size = 10000, input_weight = 'input', training_num = 0, valid_num = -1, target_uncor_num = 100, epoch_input = 0)
+run_main(gpu_id = gpu_id, folder = folder, PCM_name = PCM_name, in_filename = f'NMS_Iter{iters_max}', out_filename = f'NMS_Iter{iters_max}_eval', 
+         batch_size = 1000, input_weight = 'input', training_num = 0, valid_num = -1, target_uncor_num = 100, epoch_input = 0)
