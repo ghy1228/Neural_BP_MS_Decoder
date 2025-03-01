@@ -533,7 +533,7 @@ class LDPCNetwork(nn.Module):
 
     def load_init_weights_from_file(net, args):
     
-        path = f"./Weights/{args.filename}_In_Weight_Iter{args.iters_max}.txt"
+        path = f"./{args.folder}/{args.in_filename}_Opt_Weight_Iter{args.iters_max}.txt"
         if not os.path.exists(path):
             logging.warning(f"No init weight file: {path}. Using default init=1.")
             return
