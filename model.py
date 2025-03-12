@@ -167,6 +167,7 @@ class LDPCNetwork(nn.Module):
         """
         if q_bit == 0:
             quantized = torch.clamp(llr, -self.clip_llr, self.clip_llr)
+            return quantized
         else:
             
             max_val = (2 ** (q_bit - 1) - 1) * step_size
@@ -176,7 +177,7 @@ class LDPCNetwork(nn.Module):
             quantized = torch.round(llr / step_size) * step_size  # Apply quantization step
             quantized = torch.clamp(quantized, min_val, max_val) 
         
-        return llr_clip + (quantized - llr_clip).detach() #foward: quantized, backward: llr
+            return llr_clip + (quantized - llr_clip).detach() #foward: quantized, backward: llr
 
     def _apply_ch_weight(self, llr_in, it_idx):
         """
@@ -532,8 +533,14 @@ class LDPCNetwork(nn.Module):
 
 
     def load_init_weights_from_file(net, args):
-    
-        path = f"./{args.folder}/{args.in_filename}_Opt_Weight_Iter{args.iters_max}.txt"
+        """
+        Load initial weights from a file. If the number of values in the file is:
+        - Exactly the same as expected: Directly copy the values.
+        - Less than expected: Copy available values and initialize the rest to 1.
+        - More than expected: Copy only needed values and set the rest to 1.
+        """
+
+        path = f"./{args.folder}/{args.in_filename}_Opt_Weight.txt"
         if not os.path.exists(path):
             logging.warning(f"No init weight file: {path}. Using default init=1.")
             return
@@ -543,53 +550,81 @@ class LDPCNetwork(nn.Module):
             lines = [line.strip() for line in f]
 
         weight_dict = {
-            "cn_weight":   None,
-            "ucn_weight":   None,
-            "ch_weight":   None,
-            "cn_bias":   None,
-            "ucn_bias":   None,
+            "cn_weight": None,
+            "ucn_weight": None,
+            "ch_weight": None,
+            "cn_bias": None,
+            "ucn_bias": None,
         }
 
         idx = 0
         current_key = None
         buffer_list = []
-        
+
         while idx < len(lines):
             line = lines[idx]
             idx += 1
 
-            if line.endswith(":"):
+            if line.endswith(":"):  # Section header (weight name)
                 current_key = line.replace(":", "")
                 buffer_list = []
-            elif line == "":
+            elif line == "":  # Empty line indicates the end of a section
                 if current_key and buffer_list:
                     arr = np.array(buffer_list, dtype=np.float32)
                     weight_dict[current_key] = arr
                 buffer_list = []
-            elif line != "None":
+            elif line != "None":  # Actual weight values
                 floats = list(map(float, line.split('\t')))
                 buffer_list.append(floats)
 
+        # Ensure the last parsed section is saved
         if buffer_list and current_key:
             arr = np.array(buffer_list, dtype=np.float32)
             weight_dict[current_key] = arr
 
         for name_str, arr in weight_dict.items():
             param = getattr(net, name_str, None)
-            if arr is None:
-                setattr(net, name_str, None)
-            else:
-                if param is not None:
-                    p_data = param.data
-                    
-                    if arr.size == p_data.numel():
-                        arr = arr.reshape(p_data.shape)
 
-                    if p_data.shape == arr.shape:
-                        p_data.copy_(torch.from_numpy(arr))
-                    else:
-                        logging.warning(f"Shape mismatch for {name_str}. "
-                                        f"Expected {p_data.shape}, got {arr.shape}.")
+            if param is None:  
+                setattr(net, name_str, None)
+                continue
+
+            p_data = param.data
+            param_shape = p_data.shape
+            expected_size = p_data.numel()
+
+            if arr is not None:
+                flat_arr = arr.flatten()
+
+                if flat_arr.size < expected_size:  
+                    # Create a tensor filled with 1s
+                    full_arr = np.ones(expected_size, dtype=np.float32)
+
+                    # Copy available weights
+                    full_arr[:flat_arr.size] = flat_arr
+
+                    logging.warning(f"Weight file for {name_str} is smaller than expected. "
+                                    f"Using provided weights and initializing remaining values to 1.")
+
+                    arr = full_arr.reshape(param_shape)
+
+                elif flat_arr.size > expected_size:
+                    # Take only the required number of weights
+                    arr = flat_arr[:expected_size].reshape(param_shape)
+
+                    logging.warning(f"Weight file for {name_str} contains more values than expected. "
+                                    f"Only required values are used; extra values are ignored.")
+
+                else:
+                    # If sizes match, just reshape and use it
+                    arr = flat_arr.reshape(param_shape)
+
+                p_data.copy_(torch.from_numpy(arr))
+
+            else:
+                # If no weight data is provided, initialize everything to 1
+                logging.warning(f"No weight data found for {name_str}. Initializing to 1.")
+                p_data.fill_(1)
 
     def freeze_first_iters(net, args):
         f_iter = args.fixed_iter
