@@ -29,9 +29,9 @@ def save_model_weights(net, args, best):
     """Example: save learned weights to a text file (optional)."""
     os.makedirs("./Weights", exist_ok=True)
     if best == True:
-        path = f"./{args.folder}/{args.out_filename}_Opt_Weight_Iter{args.iters_max}.txt"
+        path = f"./{args.folder}/{args.out_filename}_Opt_Weight.txt"
     else:
-        path = f"./{args.folder}/{args.out_filename}_Weight_Iter{args.iters_max}.txt"
+        path = f"./{args.folder}/{args.out_filename}_Weight.txt"
 
     with open(path, "w") as f:
         f.write("\t".join(map(str, args.sharing)) + "\n\n")
@@ -145,66 +145,83 @@ def load_uncor_samples(args):
 def collect_uncor_samples(args, net, code_param, rng, device):
     """
     Collect uncorrected samples (frames with errors) for each SNR value.
-    For each SNR, collect args.target_uncor_num erroneous samples (using the original input LLR).
-    After collection, interleave the samples from different SNR values and write them to a file.
-    Also, log per-SNR statistics: total frames attempted, uncorrected frames collected, FER, and elapsed time.
-    File path: "./{args.folder}/{args.out_filename}_Uncor.txt"
+    Instead of storing them in memory, write each erroneous sample directly to a file.
+    After collection, reload the data, interleave the samples from different SNRs, and save the final output.
     """
 
-    # Dictionaries to store samples and stats per SNR.
-    snr_samples = {snr: [] for snr in args.SNR_array}
-    snr_stats = {
-        snr: {"frames_attempted": 0, "collected": 0, "start_time": time.time()}
-        for snr in args.SNR_array
-    }
-
-    # For each SNR, collect samples until target is reached.
-    for snr_val in args.SNR_array:
-        while snr_stats[snr_val]["collected"] < args.target_uncor_num:
-            llrs_batch = create_random_samples(
-                sample_num=args.batch_size,
-                code_rate=code_param.code_rate,
-                SNR_array=[snr_val],
-                rng=rng,
-                N=code_param.N
-            )
-            ds_batch = CustomDataset(llrs_batch)
-            loader = DataLoader(ds_batch, batch_size=args.batch_size, shuffle=False, drop_last=True)
-            for batch in loader:
-                snr_stats[snr_val]["frames_attempted"] += args.batch_size
-                # Process the batch to get error flags for each frame
-                (_, _, _, _, _, frame_error_flags) = process_batch(
-                    batch, net, code_param, args.batch_size, args.systematic, device
-                )
-                # Append erroneous samples (using original input LLR) to snr_samples
-                for i in range(args.batch_size):
-                    if frame_error_flags[i]:
-                        llr_list = batch[i].tolist() if hasattr(batch[i], "tolist") else list(batch[i])
-                        snr_samples[snr_val].append(llr_list)
-                        snr_stats[snr_val]["collected"] += 1
-                        if snr_stats[snr_val]["collected"] >= args.target_uncor_num:
-                            break
-                if snr_stats[snr_val]["collected"] >= args.target_uncor_num:
-                    break
-        elapsed = time.time() - snr_stats[snr_val]["start_time"]
-        frames_attempted = snr_stats[snr_val]["frames_attempted"]
-        collected = snr_stats[snr_val]["collected"]
-        fer = collected / frames_attempted if frames_attempted > 0 else 0.0
-        logging.info(f"SNR {snr_val:.3f}: Frames Attempted {frames_attempted}, Collected {collected}, FER {fer:.2e}, Time {elapsed:.2f}s")
-
-    # Interleave samples from each SNR in round-robin fashion.
-    interleaved_samples = []
-    for i in range(args.target_uncor_num):
+    raw_file_path = f"./{args.folder}/{args.out_filename}_Raw_Uncor.txt"
+    
+    # Step 1: Collect erroneous samples and immediately save them to a file
+    with open(raw_file_path, "w") as f:
         for snr_val in args.SNR_array:
-            interleaved_samples.append((snr_val, snr_samples[snr_val][i]))
+            collected_count = 0
+            start_time = time.time()
+            frames_attempted = 0
 
-    # Write interleaved samples to file.
-    file_path = f"./{args.folder}/{args.out_filename}_Uncor.txt"
-    with open(file_path, "w") as f:
-        for snr_val, llr_list in interleaved_samples:
-            llr_str = " ".join(f"{v:.4f}" for v in llr_list)
-            f.write(f"{snr_val:.3f} {llr_str}\n")
+            while collected_count < args.target_uncor_num:
+                # Generate random LLR samples for the given SNR
+                llrs_batch = create_random_samples(
+                    sample_num=args.batch_size,
+                    code_rate=code_param.code_rate,
+                    SNR_array=[snr_val],
+                    rng=rng,
+                    N=code_param.N
+                )
 
+                ds_batch = CustomDataset(llrs_batch)
+                loader = DataLoader(ds_batch, batch_size=args.batch_size, shuffle=False, drop_last=True)
+
+                for batch in loader:
+                    frames_attempted += args.batch_size
+                    
+                    # Process the batch and get error flags
+                    (_, _, _, _, _, frame_error_flags) = process_batch(
+                        batch, net, code_param, args.batch_size, args.systematic, device
+                    )
+
+                    # Ensure frame_error_flags is on CPU before using NumPy
+                    frame_error_flags = frame_error_flags.cpu().numpy()
+
+                    # Iterate through each sample in the batch
+                    for i in range(args.batch_size):
+                        if frame_error_flags[i]:  # If the sample has an error
+                            llr_list = batch[i].tolist() if hasattr(batch[i], "tolist") else list(batch[i])
+                            llr_str = " ".join(f"{v:.4f}" for v in llr_list)
+                            f.write(f"{snr_val:.3f} {llr_str}\n")
+                            collected_count += 1
+
+                            # Print progress update with elapsed time
+                            elapsed_time = time.time() - start_time
+                            print(f"SNR {snr_val}: {collected_count} uncor samples collected | Elapsed Time: {elapsed_time:.2f}s")
+
+                            # Stop when target number of uncorrected samples is reached
+                            if collected_count >= args.target_uncor_num:
+                                break
+                    if collected_count >= args.target_uncor_num:
+                        break
+            
+            elapsed = time.time() - start_time
+            fer = collected_count / frames_attempted if frames_attempted > 0 else 0.0
+            logging.info(f"SNR {snr_val:.3f}: Frames Attempted {frames_attempted}, Collected {collected_count}, FER {fer:.2e}, Time {elapsed:.2f}s")
+
+    # Step 2: Reload the saved data, interleave the samples, and save to the final file
+    interleaved_file_path = f"./{args.folder}/{args.out_filename}_Uncor.txt"
+    with open(raw_file_path, "r") as f:
+        lines_by_snr = {snr: [] for snr in args.SNR_array}
+        
+        # Group samples by SNR
+        for line in f:
+            snr_val = float(line.split()[0])  # First value is the SNR
+            lines_by_snr[snr_val].append(line.strip())
+
+    # Perform round-robin interleaving
+    with open(interleaved_file_path, "w") as f:
+        for i in range(args.target_uncor_num):
+            for snr_val in args.SNR_array:
+                if i < len(lines_by_snr[snr_val]):
+                    f.write(lines_by_snr[snr_val][i] + "\n")
+
+    print(f"Interleaved samples saved to {interleaved_file_path}")
 
 
 def run_validation(args, net, code_param, device, rng, epoch):
@@ -223,6 +240,11 @@ def run_validation(args, net, code_param, device, rng, epoch):
 
     total_loss = 0.0
     total_count = 0  # total number of frames processed overall
+    # Print header
+    logging.info("\nValidation Results for Epoch {}".format(epoch))
+    logging.info("{:<7} {:<8} {:<16} {:<10} {:<10} {:<10} {:<8}".format(   
+        "SNR", "Frames", "Uncor_Frames", "BER", "FER", "Loss", "Avg Iter"))
+    logging.info("-" *75)
 
     # Loop over each SNR value.
     for snr_val in args.SNR_array:
@@ -298,11 +320,12 @@ def run_validation(args, net, code_param, device, rng, epoch):
         total_loss += loss_sum
         total_count += frame_num
 
-        logging.info(f"SNR {snr_val:.3f}: Frames {frame_num} Uncor_Frames {frame_err} BER {ber:.2e} FER {fer:.2e} loss {avg_loss_snr:.2e} Avg Iter {avg_stop_iter:.2f}")
-
+        logging.info("{:<7.3f} {:<12} {:<10} {:<10.2e} {:<10.2e} {:<13.2e} {:<8.2f}".format(snr_val, frame_num, frame_err, ber, fer, avg_loss_snr, avg_stop_iter))
     avg_loss = total_loss / total_count if total_count else 0.0
     elapsed = time.time() - start_time
-    logging.info(f"[Epoch {epoch}] valid loss {avg_loss:.4f}, valid time {elapsed:.2f}s\n")
+    logging.info("-" * 75)
+    logging.info("[Epoch {}] valid loss {:.4f}, valid time {:.2f}s".format(epoch, avg_loss, elapsed))
+
     return avg_loss
 
 def run_training(args, net, code_param, device, rng, epoch):
