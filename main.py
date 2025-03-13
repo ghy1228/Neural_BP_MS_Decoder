@@ -440,9 +440,10 @@ def main(args):
 
     # Main epoch loop
     for epoch in range(1, args.epoch_input + 1):
+        
         train_loss = run_training(args, net, code_param, device, rng, epoch)
         val_loss   = run_validation(args, net, code_param, device, rng, epoch)
-        
+
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             save_model_weights(net, args, best=True)
@@ -456,19 +457,19 @@ def main(args):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--gpu_id', type=int, default=0)
-    parser.add_argument('--folder', type=str, default='wman_N0576_R34_z24')
-    parser.add_argument('--PCM_name', type=str, default='wman_N0576_R34_z24')
-    parser.add_argument('--out_filename', type=str, default='NMS')
+    parser.add_argument('--gpu_id', type=int, default=1)
+    parser.add_argument('--folder', type=str, default='BCH_63_36')
+    parser.add_argument('--PCM_name', type=str, default='BCH_63_36')
+    parser.add_argument('--out_filename', type=str, default='NMS_stable_Iter100')
     parser.add_argument('--in_filename', type=str, default='')
     parser.add_argument('--uncor_filename', type=str, default='')
 
-    parser.add_argument('--z_factor', type=int, default=24)
+    parser.add_argument('--z_factor', type=int, default=1)
     parser.add_argument('--clip_llr', type=float, default=20)
-    parser.add_argument('--decoding_type', type=str, default='MS', choices=['SP','MS'])
-    parser.add_argument('--q_bit', type=int, default=5) # 0: Floating operation, >=1: Quantization
-    parser.add_argument('--sharing', nargs='+', type=int, default=[3,0,3,0,0]) #[cn_weight,ucn_weight,ch_weight,cn_bias,ucn_bias], 1: Edges/Iters 2: Node/Iter 3: Iter, 4: Edge, 5: Node
-    parser.add_argument('--iters_max', type=int, default=20)
+    parser.add_argument('--decoding_type', type=str, default='MS_stable', choices=['SP','MS','MS_stable'])
+    parser.add_argument('--q_bit', type=int, default=0) # 0: Floating operation, >=1: Quantization
+    parser.add_argument('--sharing', nargs='+', type=int, default=[1,0,2,0,0]) #[cn_weight,ucn_weight,ch_weight,cn_bias,ucn_bias], 1: Edges/Iters 2: Node/Iter 3: Iter, 4: Edge, 5: Node
+    parser.add_argument('--iters_max', type=int, default=100)
     parser.add_argument('--fixed_iter', type=int, default=0)
     parser.add_argument('--systematic', type=str, default='off', choices=['off', 'on'])
     
@@ -478,21 +479,19 @@ if __name__ == "__main__":
     parser.add_argument('--init_cn_bias', type=int, default=0)
     parser.add_argument('--input_weight', type=str, default='none', choices=['none','input'])
 
-    parser.add_argument('--cn_mode', type=str, default='parallel',
-                        choices=['sequential', 'parallel'],
-                        help='Choose the CN update mode: sequential or parallel') 
+    parser.add_argument('--cn_mode', type=str, default='parallel', choices=['sequential', 'parallel']) 
 
     parser.add_argument('--loss_option', type=str, default='last', choices = ['multi', 'last'])
     parser.add_argument('--loss_function', type=str, default='FER', choices=['BCE', 'Soft_BER', 'FER'])    
 
     parser.add_argument('--sampling_type', type=str, default='Random',choices=['Random','Read','Collect'])
     parser.add_argument('--SNR_array', nargs='+', type=float, 
-                        default=[2,2.5,3.0,3.5,4.0])
-    parser.add_argument('--batch_size', type=int, default=20)
+                        default=[2,3,4,5,6,7,8])
+    parser.add_argument('--batch_size', type=int, default=100)
     parser.add_argument('--training_num', type=int, default=10000)
-    parser.add_argument('--valid_num', type=int, default=10000)
+    parser.add_argument('--valid_num', type=int, default=1000)
     parser.add_argument('--target_uncor_num', type=int, default=100)
-    parser.add_argument('--epoch_input', type=int, default=10)
+    parser.add_argument('--epoch_input', type=int, default=100)
     parser.add_argument('--learn_rate', type=float, default=1e-3)
     parser.add_argument('--seed_in', type=int, default=42)
     
