@@ -440,9 +440,9 @@ def main(args):
 
     # Main epoch loop
     for epoch in range(1, args.epoch_input + 1):
-        val_loss   = run_validation(args, net, code_param, device, rng, epoch)
         train_loss = run_training(args, net, code_param, device, rng, epoch)
-
+        val_loss   = run_validation(args, net, code_param, device, rng, epoch)
+        
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             save_model_weights(net, args, best=True)
