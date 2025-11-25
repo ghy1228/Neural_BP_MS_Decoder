@@ -141,11 +141,6 @@ class LDPCNetwork(nn.Module):
                     c2v_unweighted = self._cn_update_SP_par(v2c_llr)
                 else:
                     c2v_unweighted = self._cn_update_SP_seq(v2c_llr)
-            elif self.decoding_type == 'MS_stable':
-                if self.cn_mode == 'parallel':
-                    c2v_unweighted = self._cn_update_MS_stable_par(v2c_llr)
-                else:
-                    c2v_unweighted = self._cn_update_MS_stable_seq(v2c_llr)
             else:  # Default 'MS'
                 if self.cn_mode == 'parallel':
                     c2v_unweighted = self._cn_update_MS_par(v2c_llr)
@@ -381,133 +376,7 @@ class LDPCNetwork(nn.Module):
         out = 0.5 * torch.log((1.0 + out)/(1.0 - out + eps)) * 2.0
         c2v_new = out
         return c2v_new
-    
-    def _cn_update_MS_stable_par(self, v2c_llr):
-        """
-        Parallel MS implementation with comprehensive numerical stability safeguards.
-        Addresses gradient issues in high iteration counts.
-        """
-        c2v_new = torch.zeros_like(v2c_llr)
-        eps = 1e-10  # Small epsilon to prevent division by zero
-
-        ext_idx = self.edge_to_ext_edge  # [E, d_max-1]
-        absvals = v2c_llr.abs() + eps  # Add small epsilon to avoid exact zeros
-        sgnvals = torch.tanh(v2c_llr)  # Replace sign with differentiable approximation
-
-        # Gather extrinsic abs -> [B, E, d_max-1]
-        extrinsic_abs = absvals[:, ext_idx]
-        big_val = absvals.new_tensor(1e9)
-        mask_invalid = (ext_idx < 0)
-        extrinsic_abs = torch.where(
-            mask_invalid.unsqueeze(0),
-            big_val,
-            extrinsic_abs
-        )
         
-        # Calculate differentiable min approximation using LogSumExp trick
-        beta = 10.0  # Higher values make it closer to true min
-        neg_beta_x = -beta * extrinsic_abs
-        lse_min = -torch.logsumexp(neg_beta_x, dim=2) / beta
-        
-        # Regular min for forward pass
-        min_abs = extrinsic_abs.min(dim=2).values
-        
-        # STE with safeguard for small gradients near min
-        min_abs_ste = min_abs.detach() + (lse_min - lse_min.detach())
-        
-        # Gather extrinsic sign -> [B, E, d_max-1]
-        extrinsic_sgnvals = sgnvals[:, ext_idx]
-        extrinsic_sgnvals = torch.where(
-            mask_invalid.unsqueeze(0),
-            extrinsic_sgnvals.new_tensor(1.0),
-            extrinsic_sgnvals
-        )
-        
-        # Safer sign product with gradient stabilization
-        # Using log-domain multiplication for numerical stability
-        log_abs_sgn = torch.log(torch.abs(extrinsic_sgnvals) + eps)
-        sgn_sign = torch.sign(extrinsic_sgnvals)
-        sum_log_abs = torch.sum(log_abs_sgn, dim=2)
-        prod_sign = torch.prod(sgn_sign, dim=2)
-        sign_prod = prod_sign * torch.exp(sum_log_abs)
-        
-        # Apply scaling factor to prevent extreme values in early iterations
-        scale_factor = torch.tanh(torch.tensor(0.1 * min(10, self.iters_max)))
-        
-        # Combine magnitude and sign
-        out = min_abs_ste * sign_prod * scale_factor
-        
-        # Apply stronger clipping with tanh for bounded output
-        max_llr = self.clip_llr
-        out = max_llr * torch.tanh(out / max_llr)
-
-        c2v_new = out
-        return c2v_new
-
-    def _cn_update_MS_stable_seq(self, v2c_llr):
-        """
-        Sequential MS with comprehensive numerical stability improvements.
-        Addresses gradient issues with high iteration counts.
-        """
-        bsz = v2c_llr.size(0)
-        c2v_new = torch.zeros_like(v2c_llr)
-        eps = 1e-10  # Small epsilon value
-
-        for c in range(self.M):
-            edges_c = self.cn_to_edge[c]
-            if len(edges_c) == 0:
-                continue
-                
-            vals = v2c_llr[:, edges_c]
-            absvals = torch.abs(vals) + eps  # Add epsilon to avoid zeros
-            sgnvals = torch.tanh(vals)  # Smoother sign approximation
-            
-            # Safer sign product calculation using log domain
-            sgn_sign = torch.sign(sgnvals)
-            log_abs_sgn = torch.log(torch.abs(sgnvals) + eps)
-            sum_log_abs = torch.sum(log_abs_sgn, dim=1)
-            tot_sign_raw = torch.prod(sgn_sign, dim=1)
-            tot_sign = tot_sign_raw * torch.exp(sum_log_abs)
-            
-            # Get top-2 values using stable method
-            beta = 10.0  # Higher = closer to min
-            neg_beta_x = -beta * absvals
-            
-            # Stable differentiable min using LogSumExp trick
-            lse_min = -torch.logsumexp(neg_beta_x, dim=1) / beta
-            
-            # Forward path: regular min
-            top2, idx2 = torch.topk(absvals, min(2, absvals.size(1)), dim=1, largest=False)
-            mag1 = top2[:, 0]  # min1
-            mag2 = top2[:, 1] if top2.size(1) > 1 else mag1 * 1.1  # min2 or fallback
-            pos = idx2[:, 0]  # argmin1
-            
-            # STE with stabilization
-            mag1_ste = mag1.detach() + (lse_min - lse_min.detach())
-            
-            # Apply scaling factor for stability in early iterations
-            scale_factor = torch.tanh(torch.tensor(0.1 * min(10, self.iters_max)))
-            mag1_ste = mag1_ste * scale_factor
-            mag2 = mag2 * scale_factor
-            
-            # Create result tensor
-            row_idx = torch.arange(vals.size(1), device=vals.device).unsqueeze(0).expand(bsz, -1)
-            mg = mag1_ste.unsqueeze(1).expand(-1, vals.size(1)).clone()
-            mg[row_idx == pos.unsqueeze(1)] = mag2
-            
-            # Ensure sign is bounded
-            s_j = torch.where(vals < 0, -tot_sign.unsqueeze(1), tot_sign.unsqueeze(1))
-            
-            # Apply tanh-based bounded output
-            result = s_j * mg
-            max_llr = self.clip_llr
-            result = max_llr * torch.tanh(result / max_llr)
-            
-            c2v_new[:, edges_c] = result
-
-        return c2v_new
-
-    # 기존 MS 함수들은 클리핑만 추가
     def _cn_update_MS_par(self, v2c_llr):
         """
         Parallel MS using [E, d_max-1]:
