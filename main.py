@@ -460,13 +460,13 @@ if __name__ == "__main__":
     parser.add_argument('--gpu_id', type=int, default=1)
     parser.add_argument('--folder', type=str, default='BCH_63_36')
     parser.add_argument('--PCM_name', type=str, default='BCH_63_36')
-    parser.add_argument('--out_filename', type=str, default='NMS_stable_Iter100')
+    parser.add_argument('--out_filename', type=str, default='NMS_Iter100')
     parser.add_argument('--in_filename', type=str, default='')
     parser.add_argument('--uncor_filename', type=str, default='')
 
     parser.add_argument('--z_factor', type=int, default=1)
     parser.add_argument('--clip_llr', type=float, default=20)
-    parser.add_argument('--decoding_type', type=str, default='MS_stable', choices=['SP','MS','MS_stable'])
+    parser.add_argument('--decoding_type', type=str, default='MS', choices=['SP','MS'])
     parser.add_argument('--q_bit', type=int, default=0) # 0: Floating operation, >=1: Quantization
     parser.add_argument('--sharing', nargs='+', type=int, default=[1,0,2,0,0]) #[cn_weight,ucn_weight,ch_weight,cn_bias,ucn_bias], 1: Edges/Iters 2: Node/Iter 3: Iter, 4: Edge, 5: Node
     parser.add_argument('--iters_max', type=int, default=100)
