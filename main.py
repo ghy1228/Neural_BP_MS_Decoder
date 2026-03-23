@@ -50,11 +50,11 @@ def _write_weight(f, w_param, name_str):
     
     if arr.ndim == 1:
         for x in arr:
-            f.write(f"{x:.6f}\n")  # 한 줄에 하나씩 출력 (column-wise)
+            f.write(f"{x:.4f}\n")  # 한 줄에 하나씩 출력 (column-wise)
         f.write("\n")
     elif arr.ndim == 2:
         for row in arr:
-            line = "\t".join(f"{x:.6f}" for x in row)
+            line = "\t".join(f"{x:.4f}" for x in row)
             f.write(line + "\n")
         f.write("\n")
 
@@ -68,9 +68,10 @@ def process_batch(batch, net, code_param, batch_size, systematic, device):
     iters_max = dec_llr_tensor.size(0)
     if systematic == 'on':
         effective_N = code_param.N - code_param.M
-        dec_llr_tensor = dec_llr_tensor[:, :, :effective_N]
+        dec_llr_tensor_sys = dec_llr_tensor[:, :, :effective_N]
     else:
         effective_N = code_param.N
+        dec_llr_tensor_sys = dec_llr_tensor
 
     # Compute decisions
     dec_bits_tensor = (dec_llr_tensor < 0).float()
@@ -83,8 +84,8 @@ def process_batch(batch, net, code_param, batch_size, systematic, device):
         torch.argmax(valid_mask.float(), dim=0),
         torch.full((batch_size,), iters_max - 1, device=device, dtype=torch.long)
     )
-    
-    final_dec_llr = dec_llr_tensor[first_valid, torch.arange(batch_size).to(device), :]
+
+    final_dec_llr = dec_llr_tensor_sys[first_valid, torch.arange(batch_size).to(device), :]
     final_dec_bits = (final_dec_llr < 0).float()
     b_err = final_dec_bits.sum(dim=1)
     frame_error_flags = (b_err > 0)  # tensor of bool of shape (batch_size,)
@@ -95,16 +96,16 @@ def process_batch(batch, net, code_param, batch_size, systematic, device):
 
     return loss_batch, batch_bit_err, batch_frame_err, batch_size, sum_stop_iter, frame_error_flags
 
+
 def load_uncor_samples(args):
     """
     Load samples from file and store in GLOBAL_VALID_SAMPLES and GLOBAL_TRAIN_SAMPLES.
-    The first args.valid_num samples go to GLOBAL_VALID_SAMPLES and the next args.training_num samples go to GLOBAL_TRAIN_SAMPLES.
+    Uses batches_per_epoch * batch_size samples for each of valid and train sets.
     Each line in the file should have an SNR value followed by LLR values.
-    If the total number of samples in the file is less than args.valid_num + args.training_num, exit with an error.
-    Stores the SNR and LLR values as numpy arrays.
     """
     global GLOBAL_VALID_SAMPLES, GLOBAL_TRAIN_SAMPLES
 
+    n_samples = args.batches_per_epoch * args.batch_size
     file_path = f"./{args.folder}/{args.uncor_filename}_Uncor.txt"
     samples = []
     with open(file_path, "r") as f:
@@ -119,12 +120,12 @@ def load_uncor_samples(args):
             except ValueError:
                 continue
 
-    total_required = args.valid_num + args.training_num
+    total_required = 2 * n_samples
     if len(samples) < total_required:
         raise ValueError(f"Not enough samples in the file: required {total_required}, but got {len(samples)}.")
 
-    valid_samples = samples[:args.valid_num]
-    train_samples = samples[args.valid_num: args.valid_num + args.training_num]
+    valid_samples = samples[:n_samples]
+    train_samples = samples[n_samples:total_required]
 
     if valid_samples:
         snr_valid, llr_valid = zip(*valid_samples)
@@ -165,7 +166,10 @@ def collect_uncor_samples(args, net, code_param, rng, device):
                     code_rate=code_param.code_rate,
                     SNR_array=[snr_val],
                     rng=rng,
-                    N=code_param.N
+                    N=code_param.N,
+                    puncturing_idx=code_param.puncturing_idx,
+                    shortening_idx=code_param.shortening_idx,
+                    clip_llr=args.clip_llr,
                 )
 
                 ds_batch = CustomDataset(llrs_batch)
@@ -234,15 +238,22 @@ def run_validation(args, net, code_param, device, rng, epoch):
       - Uses vectorized operations for per-frame processing.
       - Stops iteration for a frame at the first iteration where H * dec_bits == 0.
       - Computes BER/FER at the stop iteration and tracks the average stop iteration.
+
+    Returns:
+        avg_loss: Average loss across all SNRs
+        results_per_snr: Dictionary with results for each SNR
+            {snr_val: {'ber': ..., 'fer': ..., 'avg_iter': ..., 'frames': ...}}
     """
     start_time = time.time()
     net.eval()
 
     total_loss = 0.0
     total_count = 0  # total number of frames processed overall
+    results_per_snr = {}  # Store results for each SNR
+
     # Print header
     logging.info("\nValidation Results for Epoch {}".format(epoch))
-    logging.info("{:<7} {:<8} {:<16} {:<10} {:<10} {:<10} {:<8}".format(   
+    logging.info("{:<7} {:<8} {:<16} {:<10} {:<10} {:<10} {:<8}".format(
         "SNR", "Frames", "Uncor_Frames", "BER", "FER", "Loss", "Avg Iter"))
     logging.info("-" *75)
 
@@ -254,21 +265,23 @@ def run_validation(args, net, code_param, device, rng, epoch):
         loss_sum = 0.0     # cumulative loss for current SNR
         stop_iter_sum = 0.0  # cumulative sum of stop iterations (0-indexed) for current SNR
 
+        valid_frames_target = args.batches_per_epoch * args.batch_size
+
         # Process batches until stopping condition is met.
         if args.sampling_type == 'Random':
-            # Keep generating batches for current SNR.
             while True:
-                # Create one batch for the current SNR.
                 llrs_batch = create_random_samples(
                     sample_num=args.batch_size,
                     code_rate=code_param.code_rate,
-                    SNR_array=[snr_val],  # only current SNR
+                    SNR_array=[snr_val],
                     rng=rng,
-                    N=code_param.N
+                    N=code_param.N,
+                    puncturing_idx=code_param.puncturing_idx,
+                    shortening_idx=code_param.shortening_idx,
+                    clip_llr=args.clip_llr,
                 )
                 ds_batch = CustomDataset(llrs_batch)
                 loader = DataLoader(ds_batch, batch_size=args.batch_size, shuffle=False, drop_last=True)
-                # There will be only one batch in this loader.
                 for batch in loader:
                     (loss_batch, batch_bit_err, batch_frame_err, batch_size,
                      sum_stop_iter, _) = process_batch(batch, net, code_param, args.batch_size, args.systematic, device)
@@ -279,13 +292,12 @@ def run_validation(args, net, code_param, device, rng, epoch):
                     frame_err += batch_frame_err
                     stop_iter_sum += sum_stop_iter
 
-                # Break conditions:
-                # If valid_num > 0, stop when total frames exceed valid_num.
-                if args.valid_num > 0 and frame_num >= args.valid_num:
-                    break
-                # If valid_num == 0, stop when frame errors exceed target_uncor_num.
-                if args.valid_num == -1 and frame_err >= args.target_uncor_num:
-                    break
+                if args.run_mode == 'eval':
+                    if frame_err >= args.target_uncor_num:
+                        break
+                else:
+                    if frame_num >= valid_frames_target:
+                        break
 
         elif args.sampling_type == 'Read':
             # GLOBAL_VALID_SAMPLES is now assumed to be a dictionary with SNR keys.
@@ -320,15 +332,26 @@ def run_validation(args, net, code_param, device, rng, epoch):
         total_loss += loss_sum
         total_count += frame_num
 
+        # Store results for this SNR
+        results_per_snr[snr_val] = {
+            'ber': ber,
+            'fer': fer,
+            'avg_loss': avg_loss_snr,
+            'avg_iter': avg_stop_iter,
+            'frames': frame_num,
+            'uncor_frames': frame_err,
+        }
+
         logging.info("{:<7.3f} {:<12} {:<10} {:<10.2e} {:<10.2e} {:<13.2e} {:<8.2f}".format(snr_val, frame_num, frame_err, ber, fer, avg_loss_snr, avg_stop_iter))
+
     avg_loss = total_loss / total_count if total_count else 0.0
     elapsed = time.time() - start_time
     logging.info("-" * 75)
     logging.info("[Epoch {}] valid loss {:.4f}, valid time {:.2f}s".format(epoch, avg_loss, elapsed))
 
-    return avg_loss
+    return avg_loss, results_per_snr
 
-def run_training(args, net, code_param, device, rng, epoch):
+def run_training(args, net, code_param, device, rng, epoch, optimizer):
     """
     Training step.
     Measures time, logs train_loss to both console and file.
@@ -336,13 +359,17 @@ def run_training(args, net, code_param, device, rng, epoch):
     start_time = time.time()
     net.train()
 
+    n_train = args.batches_per_epoch * args.batch_size
     if args.sampling_type == 'Random':
         llrs_train = create_random_samples(
-            sample_num=args.training_num,
+            sample_num=n_train,
             code_rate=code_param.code_rate,
             SNR_array=args.SNR_array,
             rng=rng,
-            N=code_param.N
+            N=code_param.N,
+            puncturing_idx=code_param.puncturing_idx,
+            shortening_idx=code_param.shortening_idx,
+            clip_llr=args.clip_llr,
         )
     elif args.sampling_type == 'Read':
         global GLOBAL_TRAIN_SAMPLES
@@ -357,26 +384,67 @@ def run_training(args, net, code_param, device, rng, epoch):
 
     ds_train = CustomDataset(llrs_train)
     loader_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=False, drop_last=True)
-    optimizer = torch.optim.Adam(net.parameters(), lr=args.learn_rate)
 
     total_loss = 0.0
-    total_count= 0
+    total_count = 0
     for llr_batch in loader_train:
         llr_batch = llr_batch.to(device)
         optimizer.zero_grad()
         loss_val = net(llr_batch)
         loss_val.backward()
         optimizer.step()
-        net.clamp_weights()
         bs = llr_batch.size(0)
         total_loss  += loss_val.item() * bs
         total_count += bs
 
     train_loss = total_loss / total_count if total_count else 0.0
     elapsed = time.time() - start_time
-    logging.info(f"[Epoch {epoch}] training loss={train_loss:.4f}, train time={elapsed:.2f}s")
+    logging.info(f"[Epoch {epoch}] training loss={train_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.2e}, train time={elapsed:.2f}s")
     return train_loss
 
+
+def log_code_specs(code_param):
+    """Log LDPC code specifications."""
+    logging.info("<------------- Code Specifications ------------->")
+    logging.info(f"N (Codeword length):        {code_param.N}")
+    logging.info(f"M (Parity check equations): {code_param.M}")
+    logging.info(f"K (Information bits):       {code_param.N - code_param.M}")
+    logging.info(f"Code Rate (K/N):            {code_param.code_rate:.4f}")
+
+    # Puncturing/Shortening info
+    num_punctured = len(code_param.puncturing_idx)
+    if num_punctured > 0:
+        logging.info(f"Punctured bits:             {num_punctured} (indices: {code_param.puncturing_idx})")
+    else:
+        logging.info(f"Punctured bits:             0 (no puncturing)")
+
+    num_shortened = len(code_param.shortening_idx)
+    if num_shortened > 0:
+        logging.info(f"Shortened bits:             {num_shortened} (indices: {code_param.shortening_idx})")
+    else:
+        logging.info(f"Shortened bits:             0 (no shortening)")
+
+    # Effective parameters
+    logging.info(f"N_effective (transmitted):  {code_param.N_effective}")
+    logging.info(f"K_effective (info bits):    {code_param.K_effective}")
+
+    # Degree distribution
+    max_vn_deg = int(np.max(code_param.VN_deg))
+    max_cn_deg = int(np.max(code_param.CN_deg))
+    avg_vn_deg = np.mean(code_param.VN_deg)
+    avg_cn_deg = np.mean(code_param.CN_deg)
+
+    logging.info(f"Max VN degree:              {max_vn_deg}")
+    logging.info(f"Avg VN degree:              {avg_vn_deg:.2f}")
+    logging.info(f"Max CN degree:              {max_cn_deg}")
+    logging.info(f"Avg CN degree:              {avg_cn_deg:.2f}")
+    logging.info(f"Total edges (E):            {code_param.E}")
+
+    # Protograph info
+    logging.info(f"Protograph size:            {code_param.M_proto} x {code_param.N_proto}")
+    logging.info(f"Lifting factor (z):         {code_param.z_value}")
+    logging.info("<===============================================>")
+    logging.info("")
 
 def setup_environment(args):
     os.makedirs(f"./{args.folder}", exist_ok=True)
@@ -388,13 +456,21 @@ def setup_environment(args):
 
     # Generate current time string for unique perf_path
     perf_path = f"./{args.folder}/{args.out_filename}_Performance.txt"
+
+    # Clear existing handlers to avoid duplication when called multiple times
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+
+    handlers = [
+        logging.StreamHandler(),
+        logging.FileHandler(perf_path, mode='w')
+    ]
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(perf_path, mode='w')
-        ]
+        handlers=handlers,
+        force=True
     )
     logging.info("<------------- Arguments ------------->")
     for k, v in vars(args).items():
@@ -412,20 +488,28 @@ def setup_environment(args):
     return rng, device
 
 def main(args):
+    # eval mode: force no training epochs
+    if args.run_mode == 'eval':
+        args.epoch_input = 0
+
     # Setup environment
     rng, device = setup_environment(args)
 
-    code_param = init_parameter(args.PCM_name, args.z_factor, args.cn_mode)
+    code_param = init_parameter(args.PCM_name, args.z_factor,
+                                args.puncturing_idx, args.shortening_idx)
+
+    # Log code specifications
+    log_code_specs(code_param)
 
     # Build network
     net = LDPCNetwork(code_param, args, device).to(device)
-    
-    if args.input_weight == "input":
+
+    if args.in_filename:
         net.load_init_weights_from_file(args)
-        
+
     if args.fixed_iter > 0:
         net.freeze_first_iters(args)
-    
+
     if args.sampling_type == "Read":
         load_uncor_samples(args)
 
@@ -435,14 +519,19 @@ def main(args):
         return
 
     best_val_loss = float("inf")
-    if args.valid_num > 0 or args.valid_num == -1:
-        val_loss = run_validation(args, net, code_param, device, rng, 0)
 
-    # Main epoch loop
+    # train mode: initial validation at epoch 0, then train loop
+    optimizer = torch.optim.Adam(net.parameters(), lr=args.learn_rate)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epoch_input, eta_min=args.learn_rate / 100
+    )
+
+    run_validation(args, net, code_param, device, rng, 0)
+
     for epoch in range(1, args.epoch_input + 1):
-        
-        train_loss = run_training(args, net, code_param, device, rng, epoch)
-        val_loss   = run_validation(args, net, code_param, device, rng, epoch)
+        run_training(args, net, code_param, device, rng, epoch, optimizer)
+        scheduler.step()
+        val_loss, _ = run_validation(args, net, code_param, device, rng, epoch)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -457,40 +546,42 @@ def main(args):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--gpu_id', type=int, default=1)
-    parser.add_argument('--folder', type=str, default='BCH_63_36')
-    parser.add_argument('--PCM_name', type=str, default='BCH_63_36')
-    parser.add_argument('--out_filename', type=str, default='NMS_Iter100')
+    parser.add_argument('--gpu_id', type=int, default=2)
+    parser.add_argument('--run_mode', type=str, default='train', choices=['train', 'eval'],
+                        help='train: full training loop | eval: single validation only (specifying --in_filename)')
+    parser.add_argument('--folder', type=str, default='5G_LDPC_R0.50_n_dec640_n512_k256_z32_s256_320')
+    parser.add_argument('--PCM_name', type=str, default='5G_LDPC_R0.50_n_dec640_n512_k256_z32_s256_320')
+    parser.add_argument('--out_filename', type=str, default='NBP_I10')
     parser.add_argument('--in_filename', type=str, default='')
+
+    parser.add_argument('--sampling_type', type=str, default='Random', choices=['Random', 'Read', 'Collect'])
     parser.add_argument('--uncor_filename', type=str, default='')
 
-    parser.add_argument('--z_factor', type=int, default=1)
+    parser.add_argument('--z_factor', type=int, default=32)
     parser.add_argument('--clip_llr', type=float, default=20)
-    parser.add_argument('--decoding_type', type=str, default='MS', choices=['SP','MS'])
-    parser.add_argument('--q_bit', type=int, default=0) # 0: Floating operation, >=1: Quantization
-    parser.add_argument('--sharing', nargs='+', type=int, default=[1,0,2,0,0]) #[cn_weight,ucn_weight,ch_weight,cn_bias,ucn_bias], 1: Edges/Iters 2: Node/Iter 3: Iter, 4: Edge, 5: Node
-    parser.add_argument('--iters_max', type=int, default=100)
+    parser.add_argument('--decoding_type', type=str, default='MS', choices=['SP', 'MS'])
+    parser.add_argument('--q_bit', type=int, default=0)  # 0: Floating operation, >=1: Quantization
+    parser.add_argument('--sharing', nargs='+', type=int, default=[1, 0, 2, 0, 0])  # [cn_weight,ucn_weight,ch_weight,cn_bias,ucn_bias]
+    parser.add_argument('--iters_max', type=int, default=10)
     parser.add_argument('--fixed_iter', type=int, default=0)
-    parser.add_argument('--systematic', type=str, default='off', choices=['off', 'on'])
-    
+    parser.add_argument('--systematic', type=str, default='on', choices=['off', 'on'])
+    parser.add_argument('--puncturing_idx', nargs='*', type=int, default=list(range(0, 64)),
+                        help='Punctured bit indices ([] means no puncturing, e.g., list(range(0, 64)))')
+    parser.add_argument('--shortening_idx', nargs='*', type=int, default=list(range(256, 320)),
+                        help='Shortened bit indices ([] means no shortening, e.g., list(range(256, 320)))')
 
-    parser.add_argument('--init_cn_weight', type=int, default=1) #-1: random values from normal distribution
-    parser.add_argument('--init_ch_weight', type=int, default=1)
-    parser.add_argument('--init_cn_bias', type=int, default=0)
-    parser.add_argument('--input_weight', type=str, default='none', choices=['none','input'])
+    parser.add_argument('--init_cn_weight', type=float, default=0.75)  # -1: truncated normal init
+    parser.add_argument('--init_ch_weight', type=float, default=1.0)
+    parser.add_argument('--init_cn_bias', type=float, default=0.0)
 
-    parser.add_argument('--cn_mode', type=str, default='parallel', choices=['sequential', 'parallel']) 
-
-    parser.add_argument('--loss_option', type=str, default='last', choices = ['multi', 'last'])
-    parser.add_argument('--loss_function', type=str, default='FER', choices=['BCE', 'Soft_BER', 'FER'])    
-
-    parser.add_argument('--sampling_type', type=str, default='Random',choices=['Random','Read','Collect'])
-    parser.add_argument('--SNR_array', nargs='+', type=float, 
-                        default=[2,3,4,5,6,7,8])
-    parser.add_argument('--batch_size', type=int, default=100)
-    parser.add_argument('--training_num', type=int, default=10000)
-    parser.add_argument('--valid_num', type=int, default=1000)
-    parser.add_argument('--target_uncor_num', type=int, default=100)
+    parser.add_argument('--loss_option', type=str, default='multi', choices=['multi', 'last'])
+    parser.add_argument('--loss_function', type=str, default='FER', choices=['BCE', 'Soft_BER', 'FER'])
+    parser.add_argument('--SNR_array', nargs='+', type=float, default=[0.5, 0.75, 1, 1.25, 1.5])
+    parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--batches_per_epoch', type=int, default=100,
+                        help='Number of batches per epoch (train and validation each use batches_per_epoch * batch_size samples)')
+    parser.add_argument('--target_uncor_num', type=int, default=500,
+                        help='Number of frame errors to collect per SNR in eval mode')
     parser.add_argument('--epoch_input', type=int, default=100)
     parser.add_argument('--learn_rate', type=float, default=1e-3)
     parser.add_argument('--seed_in', type=int, default=42)
